@@ -351,10 +351,8 @@ func (s *actionSchedulerService) executeAsync(execution *interfaces.ActionExecut
 	logger.Infof("Starting async execution: %s, mode: %s, target instances: %d",
 		execution.ID, execution.ExecutionMode, len(req.Instances))
 
-	// Update status to running
-	if err := s.logsService.UpdateExecution(ctx, execution.KNID, execution.ID, map[string]any{
-		"status": interfaces.ExecutionStatusRunning,
-	}); err != nil {
+	// Update status to running; an execution cancelled before it started stays cancelled.
+	if err := s.logsService.MarkExecutionRunning(ctx, execution.KNID, execution.ID); err != nil {
 		logger.Warnf("Failed to update execution status to running: %v", err)
 	}
 
@@ -369,9 +367,11 @@ func (s *actionSchedulerService) executeAsync(execution *interfaces.ActionExecut
 	cancelledCount := 0
 	allResults := []interfaces.ObjectExecutionResult{}
 	cancelled := false
+	var lastCancellationCheck time.Time
 
 	for i, objData := range req.ObjDatas {
-		if shouldCheckExecutionCancellation(i, len(req.ObjDatas)) {
+		if shouldCheckExecutionCancellation(i, len(req.ObjDatas), time.Since(lastCancellationCheck)) {
+			lastCancellationCheck = time.Now()
 			if s.isExecutionCancelled(ctx, execution.KNID, execution.ID) {
 				logger.Infof("Execution %s cancelled, stopping at object %d/%d", execution.ID, i, len(req.ObjDatas))
 				cancelled = true
@@ -453,17 +453,16 @@ func (s *actionSchedulerService) executeAsync(execution *interfaces.ActionExecut
 
 	endTime := time.Now().UnixMilli()
 
-	// Update final execution record
-	updates := map[string]any{
-		"status":        finalStatus,
-		"success_count": successCount,
-		"failed_count":  failedCount,
-		"results":       allResults,
-		"end_time":      endTime,
-		"duration_ms":   endTime - execution.StartTime,
-	}
-
-	if err := s.logsService.UpdateExecution(ctx, execution.KNID, execution.ID, updates); err != nil {
+	// Write the final execution record. A cancel that lands after the last cancellation
+	// check still wins: the log keeps the cancelled status the user was told about.
+	if err := s.logsService.FinishExecution(ctx, execution.KNID, execution.ID, &interfaces.ExecutionOutcome{
+		Status:       finalStatus,
+		SuccessCount: successCount,
+		FailedCount:  failedCount,
+		Results:      allResults,
+		EndTime:      endTime,
+		DurationMs:   endTime - execution.StartTime,
+	}); err != nil {
 		logger.Errorf("Failed to update execution record: %v", err)
 	}
 
@@ -595,50 +594,48 @@ func (s *actionSchedulerService) executeOnce(ctx context.Context, execution *int
 func (s *actionSchedulerService) finishOnce(ctx context.Context, execution *interfaces.ActionExecution,
 	result interfaces.ObjectExecutionResult, finalStatus string, successCount, failedCount int, endTime int64) {
 
-	updates := map[string]any{
-		"status":        finalStatus,
-		"success_count": successCount,
-		"failed_count":  failedCount,
-		"results":       []interfaces.ObjectExecutionResult{result},
-		"end_time":      endTime,
-		"duration_ms":   endTime - execution.StartTime,
-	}
-	if err := s.logsService.UpdateExecution(ctx, execution.KNID, execution.ID, updates); err != nil {
+	if err := s.logsService.FinishExecution(ctx, execution.KNID, execution.ID, &interfaces.ExecutionOutcome{
+		Status:       finalStatus,
+		SuccessCount: successCount,
+		FailedCount:  failedCount,
+		Results:      []interfaces.ObjectExecutionResult{result},
+		EndTime:      endTime,
+		DurationMs:   endTime - execution.StartTime,
+	}); err != nil {
 		logger.Errorf("Failed to update execution record: %v", err)
 	}
 }
 
-func shouldCheckExecutionCancellation(index, total int) bool {
-	return index == 0 || total <= batchSize || index%batchSize == 0
+// cancellationCheckInterval bounds how long a cancel can go unnoticed while a large
+// execution keeps invoking; the check reads the status field only, so it stays cheap.
+const cancellationCheckInterval = time.Second
+
+func shouldCheckExecutionCancellation(index, total int, sinceLastCheck time.Duration) bool {
+	return index == 0 || total <= batchSize || index%batchSize == 0 || sinceLastCheck >= cancellationCheckInterval
 }
 
 func shouldUpdateExecutionProgress(completed, total int) bool {
 	return total <= batchSize || completed%batchSize == 0
 }
 
-// isExecutionCancelled checks if the execution has been cancelled
+// isExecutionCancelled checks if the execution has been cancelled. It reads the status
+// field only, so the check stays cheap however many results the execution has.
 func (s *actionSchedulerService) isExecutionCancelled(ctx context.Context, knID, execID string) bool {
-	query := &interfaces.ActionLogDetailQuery{
-		KNID:         knID,
-		LogID:        execID,
-		ResultsLimit: 0, // Only need metadata, not results
-	}
-	exec, err := s.logsService.GetExecution(ctx, query)
+	status, err := s.logsService.GetExecutionStatus(ctx, knID, execID)
 	if err != nil {
 		logger.Warnf("Failed to check execution status: %v", err)
 		return false
 	}
-	return exec.Status == interfaces.ExecutionStatusCancelled
+	return status == interfaces.ExecutionStatusCancelled
 }
 
 // updateExecutionProgress updates the execution progress (batch update)
 func (s *actionSchedulerService) updateExecutionProgress(ctx context.Context, execution *interfaces.ActionExecution, successCount, failedCount int, results []interfaces.ObjectExecutionResult) {
-	updates := map[string]any{
-		"success_count": successCount,
-		"failed_count":  failedCount,
-		"results":       results,
-	}
-	if err := s.logsService.UpdateExecution(ctx, execution.KNID, execution.ID, updates); err != nil {
+	if err := s.logsService.UpdateExecutionProgress(ctx, execution.KNID, execution.ID, &interfaces.ExecutionProgress{
+		SuccessCount: successCount,
+		FailedCount:  failedCount,
+		Results:      results,
+	}); err != nil {
 		logger.Warnf("Failed to update execution progress: %v", err)
 	}
 }

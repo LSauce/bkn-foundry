@@ -120,6 +120,23 @@ type ObjectExecutionResult struct {
 	DurationMs   int64              `json:"duration_ms,omitempty"`
 }
 
+// ExecutionProgress is the progress an execution has made so far.
+type ExecutionProgress struct {
+	SuccessCount int
+	FailedCount  int
+	Results      []ObjectExecutionResult // every result produced so far
+}
+
+// ExecutionOutcome is the terminal record of an execution.
+type ExecutionOutcome struct {
+	Status       string // completed | failed | cancelled; a cancelled execution stays cancelled
+	SuccessCount int
+	FailedCount  int
+	Results      []ObjectExecutionResult
+	EndTime      int64
+	DurationMs   int64
+}
+
 // ActionLogQuery represents query parameters for execution logs (supports both GET query params and JSON body)
 type ActionLogQuery struct {
 	KNID                 string   `json:"-" form:"-"`
@@ -128,6 +145,7 @@ type ActionLogQuery struct {
 	Statuses             []string `json:"statuses,omitempty"` // when set, OR-match any status (takes precedence over Status)
 	TriggerType          string   `json:"trigger_type,omitempty" form:"trigger_type"`
 	InstanceIdentityHash string   `json:"instance_identity_hash,omitempty"` // exact match on duplicate fingerprint
+	Keyword              string   `json:"keyword,omitempty" form:"keyword"` // case-insensitive literal substring of the execution id
 	StartTimeRange       []int64  `json:"start_time_range,omitempty"`       // [start, end] for JSON body
 	StartTimeFrom        int64    `json:"-" form:"start_time_from"`         // for GET query params
 	StartTimeTo          int64    `json:"-" form:"start_time_to"`           // for GET query params
