@@ -6,6 +6,8 @@
 
 package interfaces
 
+import "fmt"
+
 // Action execution status constants
 const (
 	ExecutionStatusPending   = "pending"
@@ -120,11 +122,11 @@ type ObjectExecutionResult struct {
 	DurationMs   int64              `json:"duration_ms,omitempty"`
 }
 
-// ExecutionProgress is the progress an execution has made so far.
+// ExecutionProgress is the progress an execution has made so far. Results are stored
+// separately, see ActionLogsService.AppendResults.
 type ExecutionProgress struct {
 	SuccessCount int
 	FailedCount  int
-	Results      []ObjectExecutionResult // every result produced so far
 }
 
 // ExecutionOutcome is the terminal record of an execution.
@@ -132,7 +134,6 @@ type ExecutionOutcome struct {
 	Status       string // completed | failed | cancelled; a cancelled execution stays cancelled
 	SuccessCount int
 	FailedCount  int
-	Results      []ObjectExecutionResult
 	EndTime      int64
 	DurationMs   int64
 }
@@ -163,6 +164,28 @@ type ActionLogDetailQuery struct {
 	ResultsLimit  int    `form:"results_limit"`  // pagination limit for results, default 100, max 1000
 	ResultsOffset int    `form:"results_offset"` // pagination offset for results, default 0
 	ResultsStatus string `form:"results_status"` // filter results by status: "success" | "failed"
+}
+
+// MaxActionResultsWindow bounds offset+limit when paging an execution's results; it matches
+// OpenSearch's default index.max_result_window.
+const MaxActionResultsWindow = 10000
+
+// ErrActionResultsWindowExceeded rejects a results page that ends beyond MaxActionResultsWindow.
+var ErrActionResultsWindowExceeded = fmt.Errorf("results offset + limit must not exceed %d", MaxActionResultsWindow)
+
+// ActionResultsQuery selects one page of an execution's results.
+type ActionResultsQuery struct {
+	KNID   string `form:"-"`
+	LogID  string `form:"-"`
+	Offset int    `form:"offset"`
+	Limit  int    `form:"limit"`
+	Status string `form:"status"` // "success" | "failed" | "cancelled"; empty means all
+}
+
+// ActionExecutionResultList is one page of an execution's results.
+type ActionExecutionResultList struct {
+	Entries    []ObjectExecutionResult `json:"entries"`
+	TotalCount int                     `json:"total_count"`
 }
 
 // ActionExecutionList represents a list of action executions with pagination

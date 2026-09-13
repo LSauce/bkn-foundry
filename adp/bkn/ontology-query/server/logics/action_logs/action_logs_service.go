@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -32,6 +33,9 @@ var (
 type actionLogsService struct {
 	appSetting *common.AppSetting
 	osAccess   interfaces.OpenSearchAccess
+
+	// resultsIndexReady caches that the shared results index exists.
+	resultsIndexReady atomic.Bool
 }
 
 // NewActionLogsService creates a singleton instance of ActionLogsService
@@ -88,11 +92,11 @@ const (
 		"} else { ctx.op = 'noop' }"
 
 	// The terminal write. A cancel that landed while the execution was still running wins
-	// over the status the executor computed; counters, results and timing still record
-	// what actually ran.
+	// over the status the executor computed; counters and timing still record what
+	// actually ran. Results live in the results index and are not touched here.
 	finishScript = "if (ctx._source.status != params.cancelled) { ctx._source.status = params.status } " +
 		"ctx._source.success_count = params.success_count; ctx._source.failed_count = params.failed_count; " +
-		"ctx._source.results = params.results; ctx._source.end_time = params.end_time; ctx._source.duration_ms = params.duration_ms;"
+		"ctx._source.end_time = params.end_time; ctx._source.duration_ms = params.duration_ms;"
 )
 
 func painlessUpdate(source string, params map[string]any) map[string]any {
@@ -128,8 +132,8 @@ func (s *actionLogsService) MarkExecutionRunning(ctx context.Context, knID, exec
 	return nil
 }
 
-// UpdateExecutionProgress merges the counters and results into the execution without
-// reading it first and without touching its status.
+// UpdateExecutionProgress merges the counters into the execution without reading it first
+// and without touching its status.
 func (s *actionLogsService) UpdateExecutionProgress(ctx context.Context, knID, execID string, progress *interfaces.ExecutionProgress) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "UpdateExecutionProgress")
 	defer span.End()
@@ -143,7 +147,6 @@ func (s *actionLogsService) UpdateExecutionProgress(ctx context.Context, knID, e
 		"doc": map[string]any{
 			"success_count": progress.SuccessCount,
 			"failed_count":  progress.FailedCount,
-			"results":       nonNilResults(progress.Results),
 		},
 	})
 	if err != nil {
@@ -168,7 +171,6 @@ func (s *actionLogsService) FinishExecution(ctx context.Context, knID, execID st
 		"status":        outcome.Status,
 		"success_count": outcome.SuccessCount,
 		"failed_count":  outcome.FailedCount,
-		"results":       nonNilResults(outcome.Results),
 		"end_time":      outcome.EndTime,
 		"duration_ms":   outcome.DurationMs,
 	}))
@@ -238,14 +240,6 @@ func (s *actionLogsService) searchExecution(ctx context.Context, knID, execID st
 	return exec, nil
 }
 
-// nonNilResults keeps an empty result list an empty array in the stored document.
-func nonNilResults(results []interfaces.ObjectExecutionResult) []interfaces.ObjectExecutionResult {
-	if results == nil {
-		return []interfaces.ObjectExecutionResult{}
-	}
-	return results
-}
-
 // GetExecution retrieves a single execution by ID with optional results pagination
 func (s *actionLogsService) GetExecution(ctx context.Context, query *interfaces.ActionLogDetailQuery) (*interfaces.ActionExecution, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "GetExecution")
@@ -261,23 +255,6 @@ func (s *actionLogsService) GetExecution(ctx context.Context, query *interfaces.
 		return nil, err
 	}
 
-	// Apply results pagination and filtering
-	allResults := exec.Results
-	resultsTotal := len(allResults)
-
-	// Filter by status if specified
-	if query.ResultsStatus != "" {
-		filteredResults := make([]interfaces.ObjectExecutionResult, 0)
-		for _, r := range allResults {
-			if r.Status == query.ResultsStatus {
-				filteredResults = append(filteredResults, r)
-			}
-		}
-		allResults = filteredResults
-		resultsTotal = len(allResults)
-	}
-
-	// Apply pagination
 	resultsLimit := query.ResultsLimit
 	if resultsLimit <= 0 {
 		resultsLimit = 100
@@ -285,24 +262,14 @@ func (s *actionLogsService) GetExecution(ctx context.Context, query *interfaces.
 	if resultsLimit > 1000 {
 		resultsLimit = 1000
 	}
+	resultsOffset := max(query.ResultsOffset, 0)
 
-	resultsOffset := query.ResultsOffset
-	if resultsOffset < 0 {
-		resultsOffset = 0
+	page, err := s.pageResults(ctx, query.KNID, exec, query.ResultsStatus, resultsOffset, resultsLimit)
+	if err != nil {
+		return nil, err
 	}
-
-	// Slice the results based on pagination
-	startIdx := resultsOffset
-	endIdx := resultsOffset + resultsLimit
-
-	if startIdx >= len(allResults) {
-		exec.Results = []interfaces.ObjectExecutionResult{}
-	} else {
-		if endIdx > len(allResults) {
-			endIdx = len(allResults)
-		}
-		exec.Results = allResults[startIdx:endIdx]
-	}
+	exec.Results = page.Entries
+	resultsTotal := page.TotalCount
 
 	// Set pagination metadata
 	exec.ResultsTotal = resultsTotal
@@ -492,11 +459,58 @@ func (s *actionLogsService) QueryExecutions(ctx context.Context, query *interfac
 	return result, nil
 }
 
-// ensureIndexExists creates the index if it doesn't exist
+// executionsIndexBody is the settings and mapping of a per-knowledge-network execution index.
+var executionsIndexBody = map[string]any{
+	"settings": map[string]any{
+		"number_of_shards":   1,
+		"number_of_replicas": 0,
+	},
+	"mappings": map[string]any{
+		"properties": map[string]any{
+			"id":                 map[string]any{"type": "keyword"},
+			"kn_id":              map[string]any{"type": "keyword"},
+			"action_type_id":     map[string]any{"type": "keyword"},
+			"action_type_name":   map[string]any{"type": "keyword"},
+			"action_source_type": map[string]any{"type": "keyword"},
+			"object_type_id":     map[string]any{"type": "keyword"},
+			"trigger_type":       map[string]any{"type": "keyword"},
+			"status":             map[string]any{"type": "keyword"},
+			"total_count":        map[string]any{"type": "integer"},
+			"success_count":      map[string]any{"type": "integer"},
+			"failed_count":       map[string]any{"type": "integer"},
+			"executor_id":        map[string]any{"type": "keyword"},
+			"executor": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":   map[string]any{"type": "keyword"},
+					"type": map[string]any{"type": "keyword"},
+					"name": map[string]any{"type": "keyword"},
+				},
+			},
+			"start_time":  map[string]any{"type": "long"},
+			"end_time":    map[string]any{"type": "long"},
+			"duration_ms": map[string]any{"type": "long"},
+			// New indexes only. Existing indexes rely on dynamic mapping (text + .keyword);
+			// term queries still match because the fingerprint is a single [0-9a-f] token.
+			"instance_identity_hash": map[string]any{"type": "keyword"},
+			"results":                map[string]any{"type": "nested"},
+			"dynamic_params":         map[string]any{"type": "object", "enabled": false},
+			"action_source":          map[string]any{"type": "object", "enabled": false},
+			"action_type_snapshot":   map[string]any{"type": "object", "enabled": false},
+		},
+	},
+}
+
+// ensureIndexExists creates a knowledge network's execution index if it doesn't exist.
+func (s *actionLogsService) ensureIndexExists(ctx context.Context, indexName string) error {
+	return s.createIndexIfMissing(ctx, indexName, executionsIndexBody)
+}
+
+// createIndexIfMissing creates the index if it doesn't exist.
 // This function is safe for concurrent calls - if multiple requests try to create
 // the same index simultaneously, only one will succeed and others will detect the
 // index already exists.
-func (s *actionLogsService) ensureIndexExists(ctx context.Context, indexName string) error {
+func (s *actionLogsService) createIndexIfMissing(ctx context.Context, indexName string, indexBody map[string]any) error {
 	exists, err := s.osAccess.IndexExists(ctx, indexName)
 	if err != nil {
 		return err
@@ -504,48 +518,6 @@ func (s *actionLogsService) ensureIndexExists(ctx context.Context, indexName str
 
 	if exists {
 		return nil
-	}
-
-	// Create the index with mappings
-	indexBody := map[string]any{
-		"settings": map[string]any{
-			"number_of_shards":   1,
-			"number_of_replicas": 0,
-		},
-		"mappings": map[string]any{
-			"properties": map[string]any{
-				"id":                 map[string]any{"type": "keyword"},
-				"kn_id":              map[string]any{"type": "keyword"},
-				"action_type_id":     map[string]any{"type": "keyword"},
-				"action_type_name":   map[string]any{"type": "keyword"},
-				"action_source_type": map[string]any{"type": "keyword"},
-				"object_type_id":     map[string]any{"type": "keyword"},
-				"trigger_type":       map[string]any{"type": "keyword"},
-				"status":             map[string]any{"type": "keyword"},
-				"total_count":        map[string]any{"type": "integer"},
-				"success_count":      map[string]any{"type": "integer"},
-				"failed_count":       map[string]any{"type": "integer"},
-				"executor_id":        map[string]any{"type": "keyword"},
-				"executor": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":   map[string]any{"type": "keyword"},
-						"type": map[string]any{"type": "keyword"},
-						"name": map[string]any{"type": "keyword"},
-					},
-				},
-				"start_time":  map[string]any{"type": "long"},
-				"end_time":    map[string]any{"type": "long"},
-				"duration_ms": map[string]any{"type": "long"},
-				// New indexes only. Existing indexes rely on dynamic mapping (text + .keyword);
-				// term queries still match because the fingerprint is a single [0-9a-f] token.
-				"instance_identity_hash": map[string]any{"type": "keyword"},
-				"results":                map[string]any{"type": "nested"},
-				"dynamic_params":         map[string]any{"type": "object", "enabled": false},
-				"action_source":          map[string]any{"type": "object", "enabled": false},
-				"action_type_snapshot":   map[string]any{"type": "object", "enabled": false},
-			},
-		},
 	}
 
 	if err := s.osAccess.CreateIndex(ctx, indexName, indexBody); err != nil {
