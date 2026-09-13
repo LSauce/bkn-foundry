@@ -433,14 +433,16 @@ func (b *bknBackendAccess) GetRelationTypeDetail(ctx context.Context, knID strin
 		return emptyRelationTypes, nil
 	}
 
-	// Handle the returned result.
-	var releationTypes []*interfaces.RelationType
-	if err := sonic.Unmarshal(respBody, &releationTypes); err != nil {
+	// bkn-backend wraps the list as {"entries": []}, as it does for object types.
+	var response struct {
+		Entries []*interfaces.RelationType `json:"entries"`
+	}
+	if err := sonic.Unmarshal(respBody, &response); err != nil {
 		b.logger.Errorf("[BknBackendAccess]GetRelationTypeDetail unmalshal releationTypes failed: %v\n", err)
 		return emptyRelationTypes, err
 	}
 
-	return releationTypes, nil
+	return response.Entries, nil
 }
 
 // SearchActionTypes searches action types.
@@ -594,14 +596,16 @@ func (b *bknBackendAccess) GetActionTypeDetail(ctx context.Context, knID string,
 		return emptyActionTypes, nil
 	}
 
-	// Handle the returned result.
-	var actionTypes []*interfaces.ActionType
-	if err := sonic.Unmarshal(respBody, &actionTypes); err != nil {
+	// bkn-backend wraps the list as {"entries": []}, as it does for object and relation types.
+	var response struct {
+		Entries []*interfaces.ActionType `json:"entries"`
+	}
+	if err := sonic.Unmarshal(respBody, &response); err != nil {
 		b.logger.Errorf("[BknBackendAccess]GetActionTypeDetail unmalshal actionTypes failed: %v\n", err)
 		return emptyActionTypes, err
 	}
 
-	return actionTypes, nil
+	return response.Entries, nil
 }
 
 // metricsListEntry is one entry of the bkn-backend GET .../metrics response.
