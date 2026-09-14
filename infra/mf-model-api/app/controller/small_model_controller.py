@@ -1,3 +1,5 @@
+import re
+
 from fastapi.responses import JSONResponse
 
 from app.commons.errors.codes import ParamValidationErrors
@@ -464,7 +466,15 @@ async def embedding_model_used(request, userId, language, role, func_module, pri
 
     except UpstreamModelError as e:
         status_code = e.status if e.status in (400, 401, 403, 404, 422, 429) else 502
-        error_dict = ModelFactory_ExternalSmallModel_Used_ConnectError.copy()
+        if e.status in (400, 422):
+            error_dict = ModelFactory_ExternalSmallModel_Used_InvalidParameter.copy()
+            limit = re.search(
+                r"(?i)(?:batch\s+size.*?(?:larger than|more than|at most|<=?)\s*|"
+                r"maximum\s+(?:length|size|number)\s+(?:of\s+)?)\s*(\d+)", e.detail)
+            if limit:
+                error_dict["solution"] = f"batch_size_limit: {limit.group(1)}"
+        else:
+            error_dict = ModelFactory_ExternalSmallModel_Used_ConnectError.copy()
         error_dict["detail"] = e.detail
         StandLogger.error(
             f"call embeddingError,model_name={model_name},model_id={model_id},"
