@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/bytedance/sonic"
@@ -59,8 +60,7 @@ func (v *vegaAccess) RawQuery(ctx context.Context, req *interfaces.VegaRawQueryR
 	}
 	if (respCode < http.StatusOK) || (respCode >= http.StatusMultipleChoices) {
 		v.logger.WithContext(ctx).Errorf("[VegaAccess] RawQuery resp failed, code=%d, body=%s", respCode, string(respBody))
-		return nil, infraErr.DefaultHTTPError(ctx, respCode,
-			fmt.Sprintf("vega raw query failed: %s", string(respBody)))
+		return nil, classifyRawQueryError(ctx, respCode, respBody)
 	}
 
 	resp := &interfaces.VegaRawQueryResp{}
@@ -73,6 +73,56 @@ func (v *vegaAccess) RawQuery(ctx context.Context, req *interfaces.VegaRawQueryR
 			fmt.Sprintf("parse vega raw query response failed: %v", err))
 	}
 	return resp, nil
+}
+
+// vegaPublicForbidden is the code Vega answers with when the caller's own
+// permissions do not cover a resource the statement references. It is the
+// generic 403 code, so the denial is recognized only together with
+// vegaViewDetailOperation in the details.
+const vegaPublicForbidden = "Public.Forbidden"
+
+// vegaViewDetailOperation is the operation Vega names when it refuses a
+// resource read ("Access denied: insufficient permissions for[view_detail]").
+const vegaViewDetailOperation = "view_detail"
+
+// classifyRawQueryError maps a non-2xx Vega raw query response.
+//
+// run_sql reads resources under the caller's own identity: unlike the other
+// query tools it does not follow knowledge-network authorization, so a caller
+// authorized only through object types is refused by Vega's view_detail check on
+// the resource. That refusal used to reach the caller as the raw Vega body
+// ("vega raw query failed: {...insufficient permissions for[view_detail]}"), which
+// said neither why the knowledge-network grant did not apply nor what to use
+// instead. It now carries a localized detail naming the missing grant and the
+// object-query alternatives. See #1543.
+//
+// The denial does not forward Vega's body. Every other failure, including a 403
+// that does not name view_detail, keeps its status and its previous detail, so a
+// refusal this explanation does not fit is never relabelled as one.
+func classifyRawQueryError(ctx context.Context, code int, body []byte) error {
+	if code == http.StatusForbidden {
+		errorCode, errorDetails := vegaErrorFields(body)
+		if errorCode == vegaPublicForbidden && strings.Contains(errorDetails, vegaViewDetailOperation) {
+			return infraErr.DefaultHTTPError(ctx, http.StatusForbidden,
+				infraErr.LocalizedDetail(ctx, "RunSQLResourceForbidden"))
+		}
+	}
+	return infraErr.DefaultHTTPError(ctx, code, fmt.Sprintf("vega raw query failed: %s", string(body)))
+}
+
+// vegaErrorFields reads error_code and error_details from a Vega error body.
+// Both are empty when the body is not Vega's envelope, for example a gateway
+// page.
+func vegaErrorFields(body []byte) (string, string) {
+	var envelope struct {
+		ErrorCode    string `json:"error_code"`
+		ErrorDetails any    `json:"error_details"`
+	}
+	if len(body) == 0 || sonic.Unmarshal(body, &envelope) != nil {
+		return "", ""
+	}
+	details, _ := envelope.ErrorDetails.(string)
+	return envelope.ErrorCode, details
 }
 
 // vegaEntriesWrapper is the unified {"entries":[...]} envelope for Vega get-by-ids APIs.
