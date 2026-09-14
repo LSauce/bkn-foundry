@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf16"
 
+	"vega-backend/common"
 	"vega-backend/interfaces"
 	"vega-backend/logics/filter_condition"
 )
@@ -152,26 +154,43 @@ func (c *OpenSearchConnector) ConvertFilterConditionWithOpr(condition interfaces
 	}
 }
 
-// fulltextFieldName returns the field name that should be hit in the full-text search (match/match_phrase/multi_match).
-// The full-text capability of the string field is attached to the text subfield (see applyFulltextFeature) and must be used
-// 'Field name.< Subfield name >' hits the word segmentation subfield; otherwise, it will fall to the keyword main field for exact matching.
-// The main field of the text field itself is the full text, so use a bare field name.
+// fulltextFieldName returns the physical field name used by match/match_phrase/multi_match.
+// A string field uses its configured full-text multi-field, falling back to the default name.
+// A text field is already a full-text field and therefore uses its main physical name.
 func fulltextFieldName(prop *interfaces.Property) string {
 	if prop == nil {
 		return ""
 	}
+	fieldName := propertyPhysicalFieldName(prop)
 	if prop.Type == interfaces.DataType_String {
 		for _, f := range prop.Features {
 			if f.FeatureType == interfaces.PropertyFeatureType_Fulltext {
-				sub := f.FeatureName
-				if sub == "" {
-					sub = "fulltext"
-				}
-				return prop.Name + "." + sub
+				return featurePhysicalFieldName(fieldName, f.FeatureName, interfaces.LocalIndexFulltextSubfieldName)
 			}
 		}
 	}
+	return fieldName
+}
+
+func propertyPhysicalFieldName(prop *interfaces.Property) string {
+	if prop == nil {
+		return ""
+	}
+	if prop.OriginalName != "" {
+		return prop.OriginalName
+	}
 	return prop.Name
+}
+
+func featurePhysicalFieldName(fieldName string, configuredName string, defaultName string) string {
+	featureName := strings.TrimSpace(configuredName)
+	if featureName == "" {
+		featureName = defaultName
+	}
+	if strings.HasPrefix(featureName, fieldName+".") {
+		return featureName
+	}
+	return fieldName + "." + featureName
 }
 
 // ConvertFilterConditionMultiMatch converts a MultiMatchCond to OpenSearch DSL.
@@ -220,19 +239,23 @@ func (c *OpenSearchConnector) ConvertFilterConditionEqual(condition interfaces.F
 	}
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
+		if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+			return nil, err
+		}
 		return map[string]any{
 			"term": map[string]any{
 				fieldName + keyword: cond.Value,
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value == doc['%s'].value", fieldName+keyword, cond.Rfield.OriginalName+keyword),
-			},
-		}, nil
+		rightFieldName := propertyPhysicalFieldName(cond.Rfield)
+		rightKeyword, err := c.getKeywordSuffix(rightFieldName, schemaDefinition)
+		if err != nil {
+			return nil, err
+		}
+		return fieldComparisonScript(fieldName+keyword, "==", rightFieldName+rightKeyword), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
@@ -254,6 +277,9 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotEqual(condition interface
 	}
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
+		if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+			return nil, err
+		}
 		return map[string]any{
 			"bool": map[string]any{
 				"must_not": map[string]any{
@@ -264,13 +290,14 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotEqual(condition interface
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value != doc['%s'].value", fieldName+keyword, cond.Rfield.OriginalName+keyword),
-			},
-		}, nil
+		rightFieldName := propertyPhysicalFieldName(cond.Rfield)
+		rightKeyword, err := c.getKeywordSuffix(rightFieldName, schemaDefinition)
+		if err != nil {
+			return nil, err
+		}
+		return fieldComparisonScript(fieldName+keyword, "!=", rightFieldName+rightKeyword), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
@@ -292,13 +319,10 @@ func (c *OpenSearchConnector) ConvertFilterConditionGt(condition interfaces.Filt
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value > doc['%s'].value", cond.Lfield.OriginalName, cond.Rfield.OriginalName),
-			},
-		}, nil
+		return fieldComparisonScript(
+			propertyPhysicalFieldName(cond.Lfield), ">", propertyPhysicalFieldName(cond.Rfield)), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
@@ -320,13 +344,10 @@ func (c *OpenSearchConnector) ConvertFilterConditionGte(condition interfaces.Fil
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value >= doc['%s'].value", cond.Lfield.OriginalName, cond.Rfield.OriginalName),
-			},
-		}, nil
+		return fieldComparisonScript(
+			propertyPhysicalFieldName(cond.Lfield), ">=", propertyPhysicalFieldName(cond.Rfield)), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
@@ -348,13 +369,10 @@ func (c *OpenSearchConnector) ConvertFilterConditionLt(condition interfaces.Filt
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value < doc['%s'].value", cond.Lfield.OriginalName, cond.Rfield.OriginalName),
-			},
-		}, nil
+		return fieldComparisonScript(
+			propertyPhysicalFieldName(cond.Lfield), "<", propertyPhysicalFieldName(cond.Rfield)), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
@@ -376,13 +394,22 @@ func (c *OpenSearchConnector) ConvertFilterConditionLte(condition interfaces.Fil
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
-		return map[string]any{
-			"script": map[string]any{
-				"source": fmt.Sprintf("doc['%s'].value <= doc['%s'].value", cond.Lfield.OriginalName, cond.Rfield.OriginalName),
-			},
-		}, nil
+		return fieldComparisonScript(
+			propertyPhysicalFieldName(cond.Lfield), "<=", propertyPhysicalFieldName(cond.Rfield)), nil
 	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
+		return nil, filter_condition.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
+	}
+}
+
+func fieldComparisonScript(leftField string, operator string, rightField string) map[string]any {
+	return map[string]any{
+		"script": map[string]any{
+			"source": fmt.Sprintf("doc[params.left].value %s doc[params.right].value", operator),
+			"params": map[string]any{
+				"left":  leftField,
+				"right": rightField,
+			},
+		},
 	}
 }
 
@@ -404,6 +431,9 @@ func (c *OpenSearchConnector) ConvertFilterConditionIn(condition interfaces.Filt
 	}
 	keyword, err := c.getKeywordSuffix(fieldName, schemaDefinition)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
 		return nil, err
 	}
 
@@ -432,6 +462,9 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotIn(condition interfaces.F
 	}
 	keyword, err := c.getKeywordSuffix(fieldName, schemaDefinition)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
 		return nil, err
 	}
 
@@ -590,7 +623,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionRange(condition interfaces.F
 
 	values := cond.Value
 	if len(values) != 2 {
-		return nil, fmt.Errorf("range condition requires exactly 2 values")
+		return nil, filter_condition.NewConditionBuildError("range condition requires exactly 2 values")
 	}
 
 	return map[string]any{
@@ -617,7 +650,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionOutRange(condition interface
 
 	values := cond.Value
 	if len(values) != 2 {
-		return nil, fmt.Errorf("out_range condition requires exactly 2 values")
+		return nil, filter_condition.NewConditionBuildError("out_range condition requires exactly 2 values")
 	}
 
 	return map[string]any{
@@ -870,7 +903,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionBetween(condition interfaces
 
 	values := cond.Value
 	if len(values) != 2 {
-		return nil, fmt.Errorf("between condition requires exactly 2 values")
+		return nil, filter_condition.NewConditionBuildError("between condition requires exactly 2 values")
 	}
 
 	return map[string]any{
@@ -980,10 +1013,10 @@ func (c *OpenSearchConnector) ConvertFilterConditionBefore(condition interfaces.
 
 	values := cond.Value
 	if len(values) != 2 {
-		return nil, fmt.Errorf("before condition requires exactly 2 values")
+		return nil, filter_condition.NewConditionBuildError("before condition requires exactly 2 values")
 	}
 
-	interval, ok := values[0].(float64)
+	interval, ok := common.NumberAsFloat64(values[0])
 	if !ok {
 		return nil, fmt.Errorf("condition [before] interval value should be a number")
 	}
@@ -1176,17 +1209,60 @@ func (c *OpenSearchConnector) legacyLikeWildcardRegexp(input string) string {
 	return result.String()
 }
 
-// in some query scenarios (such as eq/in), the getKeywordSuffix text type needs to use a subfield of the keyword type to return the keyword suffix; otherwise, it returns an empty string
+// In exact-match query scenarios, text fields use their configured keyword multi-field.
 func (c *OpenSearchConnector) getKeywordSuffix(fieldName string, schemaDefinition []*interfaces.Property) (string, error) {
 	for _, prop := range schemaDefinition {
-		if prop.OriginalName == fieldName && prop.Type == interfaces.DataType_Text {
+		if propertyPhysicalFieldName(prop) == fieldName && prop.Type == interfaces.DataType_Text {
 			for _, feature := range prop.Features {
 				if feature.FeatureType == interfaces.PropertyFeatureType_Keyword {
-					return "." + feature.FeatureName, nil
+					physicalName := featurePhysicalFieldName(fieldName, feature.FeatureName, interfaces.LocalIndexKeywordSubfieldName)
+					return strings.TrimPrefix(physicalName, fieldName), nil
 				}
 			}
-			return "", fmt.Errorf("text field %s has no keyword feature, cannot be used for comparison", fieldName)
+			return "", filter_condition.NewConditionBuildError("text field %s has no keyword feature; re-save the resource configuration and rebuild the local index, or use match", fieldName)
 		}
 	}
 	return "", nil
+}
+
+func validateKeywordValues(fieldName string, value any, schemaDefinition []*interfaces.Property) error {
+	for _, prop := range schemaDefinition {
+		if prop == nil || propertyPhysicalFieldName(prop) != fieldName ||
+			(prop.Type != interfaces.DataType_String && prop.Type != interfaces.DataType_Text) {
+			continue
+		}
+		for _, feature := range prop.Features {
+			if feature.FeatureType != interfaces.PropertyFeatureType_Keyword {
+				continue
+			}
+			limit, ok := positiveInt(feature.Config["ignore_above"])
+			if !ok {
+				return nil
+			}
+			values, ok := value.([]any)
+			if !ok {
+				values = []any{value}
+			}
+			for _, candidate := range values {
+				text, ok := candidate.(string)
+				// OpenSearch compares ignore_above with Java String.length(), whose
+				// unit is UTF-16 code units rather than Unicode code points.
+				if ok && len(utf16.Encode([]rune(text))) > limit {
+					return filter_condition.NewConditionBuildError(
+						"value for %s field %s exceeds keyword ignore_above %d and cannot be compared exactly", prop.Type, fieldName, limit)
+				}
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+func positiveInt(value any) (int, bool) {
+	typed, ok := common.NumberAsInt64(value)
+	converted := int(typed)
+	if !ok || typed != int64(converted) || converted <= 0 {
+		return 0, false
+	}
+	return converted, true
 }

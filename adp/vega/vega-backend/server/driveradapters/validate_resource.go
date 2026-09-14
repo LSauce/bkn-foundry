@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
@@ -47,6 +48,16 @@ func validateResourceRequestSchema(ctx context.Context, req *interfaces.Resource
 	case interfaces.ResourceCategoryLogicView:
 		return validateLogicViewRequest(ctx, req)
 	case interfaces.ResourceCategoryDataset:
+		if req.IndexConfig != nil {
+			if len(req.IndexConfig.PrimaryKeyFields) > 0 {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter_PrimaryKeyFields).
+					WithErrorDetails("primary_key_fields is not supported for dataset resources")
+			}
+			if len(req.IndexConfig.IncrementalFields) > 0 {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter_IncrementalFields).
+					WithErrorDetails("incremental_fields is not supported for dataset resources")
+			}
+		}
 		if len(req.SchemaDefinition) == 0 {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Dataset_InvalidParameter_SchemaDefinition).
 				WithErrorDetails("schema_definition is required and must contain at least one field")
@@ -139,10 +150,27 @@ func validateSchemaProperties(ctx context.Context, props []*interfaces.Property,
 func validatePropertyFeatures(ctx context.Context, prop *interfaces.Property, propsMap map[string]*interfaces.Property, allowRefProperty bool) error {
 	enabledMap := make(map[string]bool)
 	featureNameMap := make(map[string]struct{})
-	for _, f := range prop.Features {
+	for i := range prop.Features {
+		f := &prop.Features[i]
 		if f.FeatureName == "" {
+			switch f.FeatureType {
+			case interfaces.PropertyFeatureType_Keyword:
+				f.FeatureName = interfaces.LocalIndexKeywordSubfieldName
+			case interfaces.PropertyFeatureType_Fulltext:
+				f.FeatureName = interfaces.LocalIndexFulltextSubfieldName
+			case interfaces.PropertyFeatureType_Vector:
+				if f.RefProperty != "" {
+					break
+				}
+				fallthrough
+			default:
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Dataset_InvalidParameter_FieldFeatureName).
+					WithErrorDetails("The field feature name is null")
+			}
+		}
+		if strings.HasPrefix(f.FeatureName, prop.Name+".") {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Dataset_InvalidParameter_FieldFeatureName).
-				WithErrorDetails("The field feature name is null")
+				WithErrorDetails(fmt.Sprintf("feature name %q must be relative to property %q", f.FeatureName, prop.Name))
 		}
 		if utf8.RuneCountInString(f.FeatureName) > interfaces.MaxLength_PropertyFeatureName {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Dataset_LengthExceeded_FieldFeatureName).
@@ -378,6 +406,12 @@ func validateViewFields(ctx context.Context, viewFields []*interfaces.ViewProper
 		}
 
 		// Verification feature
+		for _, feature := range field.Features {
+			if strings.HasPrefix(feature.FeatureName, field.Name+".") {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_LogicView_InvalidParameter_FieldFeatureName).
+					WithErrorDetails(fmt.Sprintf("feature name %q must be relative to property %q", feature.FeatureName, field.Name))
+			}
+		}
 		err := validateFeatures(ctx, fieldsMap, field.Features)
 		if err != nil {
 			return err
@@ -393,7 +427,8 @@ func validateFeatures(ctx context.Context, fieldsMap map[string]*interfaces.View
 	enabledMap := make(map[string]bool)
 	featureNameMap := make(map[string]struct{})
 	for _, f := range features {
-		if f.FeatureName == "" {
+		if f.FeatureName == "" &&
+			(f.FeatureType != interfaces.PropertyFeatureType_Vector || f.RefProperty == "") {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_LogicView_InvalidParameter_FieldFeatureName).
 				WithErrorDetails("The field feature name is null")
 		}

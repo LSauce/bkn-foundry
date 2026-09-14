@@ -13,6 +13,8 @@ import (
 
 	"vega-backend/interfaces"
 	"vega-backend/logics/filter_condition"
+	"vega-backend/logics/local_index"
+	resourcelogic "vega-backend/logics/resource"
 )
 
 // resolveVectorConditions converts the query text in the vector retrieval conditions into vectors in place and replaces the fields with
@@ -25,20 +27,27 @@ import (
 //
 // When the condition is already a vector (the value is not a string), it is released as is: the old path of the data view has calculated the vector by itself.
 func (rds *resourceDataService) resolveVectorConditions(ctx context.Context,
-	resource *interfaces.Resource, cfg *interfaces.FilterCondCfg) error {
+	resource *interfaces.Resource, cfg *interfaces.FilterCondCfg, ignoreLocalIndex bool) error {
 
 	if cfg == nil {
 		return nil
 	}
 
 	for _, sub := range cfg.SubConds {
-		if err := rds.resolveVectorConditions(ctx, resource, sub); err != nil {
+		if err := rds.resolveVectorConditions(ctx, resource, sub, ignoreLocalIndex); err != nil {
 			return err
 		}
 	}
 
 	if cfg.Operation != filter_condition.OperationKnnVector {
 		return nil
+	}
+	if resource != nil && resource.Category == interfaces.ResourceCategoryTable &&
+		(ignoreLocalIndex || !resourcelogic.HasAvailableLocalIndex(resource)) {
+		if ignoreLocalIndex {
+			return fmt.Errorf("condition [knn_vector] cannot use the local index while ignore_local_index is true")
+		}
+		return fmt.Errorf("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
 	}
 	text, ok := cfg.Value.(string)
 	if !ok {
@@ -83,7 +92,7 @@ func vectorFieldFor(resource *interfaces.Resource, name string) (string, error) 
 	if resource == nil {
 		return "", fmt.Errorf("condition [knn_vector] left field '%s' has no resource context", name)
 	}
-	if !interfaces.HasAvailableLocalIndex(resource) {
+	if !resourcelogic.HasAvailableLocalIndex(resource) {
 		return "", fmt.Errorf("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
 	}
 
@@ -98,12 +107,14 @@ func vectorFieldFor(resource *interfaces.Resource, name string) (string, error) 
 			if feature.FeatureType != interfaces.PropertyFeatureType_Vector {
 				continue
 			}
-			source := prop.Name
 			if feature.RefProperty != "" {
-				source = feature.RefProperty
+				if feature.RefProperty == name {
+					return feature.RefProperty, nil
+				}
+				continue
 			}
-			if source == name {
-				return interfaces.LocalIndexVectorFieldName(source), nil
+			if prop.Name == name {
+				return local_index.VectorFieldName(prop.Name), nil
 			}
 		}
 	}
@@ -120,18 +131,12 @@ func (rds *resourceDataService) embeddingModelForIndex(ctx context.Context,
 		return "", fmt.Errorf("condition [knn_vector] resource has no index configuration")
 	}
 	for _, prop := range resource.SchemaDefinition {
-		if prop == nil {
+		if prop == nil || prop.Name != field {
 			continue
 		}
 		for _, feature := range prop.Features {
-			if feature.FeatureType != interfaces.PropertyFeatureType_Vector {
-				continue
-			}
-			source := prop.Name
-			if feature.RefProperty != "" {
-				source = feature.RefProperty
-			}
-			if source != field {
+			if feature.FeatureType != interfaces.PropertyFeatureType_Vector ||
+				(feature.RefProperty != "" && feature.RefProperty != prop.Name) {
 				continue
 			}
 			if modelID, ok := feature.Config["embedding_model"].(string); ok && strings.TrimSpace(modelID) != "" {

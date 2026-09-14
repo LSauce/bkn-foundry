@@ -18,6 +18,7 @@ import (
 	"vega-backend/interfaces"
 	"vega-backend/logics"
 	"vega-backend/logics/catalog"
+	"vega-backend/logics/filter_condition"
 	"vega-backend/logics/local_index"
 	"vega-backend/logics/model_factory"
 	"vega-backend/logics/permission"
@@ -125,12 +126,25 @@ func (ds *datasetService) ListDocuments(ctx context.Context, res *interfaces.Res
 	documents, total, err := ds.lim.ListDocuments(ctx, res.LocalIndexName, res, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List dataset documents failed")
+		if reason, ok := filter_condition.RequestSideQueryError(err); ok {
+			return nil, 0, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+				WithErrorDetails(reason)
+		}
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
 			WithErrorDetails(err.Error())
 	}
 
 	span.SetStatus(codes.Ok, "")
 	return documents, total, nil
+}
+
+// CountDocuments 返回 Dataset 当前本地索引中的文档总数。
+func (ds *datasetService) CountDocuments(ctx context.Context, res *interfaces.Resource) (int64, error) {
+	_, total, err := ds.ListDocuments(ctx, res, &interfaces.ResourceDataQueryParams{
+		Paging:    interfaces.PagingRequest{Limit: 1},
+		NeedTotal: true,
+	})
+	return total, err
 }
 
 // GetDocuments retrieves documents in input order. With ignoreMissing enabled,
@@ -279,9 +293,30 @@ func (ds *datasetService) DeleteDocumentsByQuery(ctx context.Context, res *inter
 		span.SetStatus(codes.Error, "Permission denied")
 		return err
 	}
+	querySchema := local_index.SchemaForQuery(res.SchemaDefinition)
+	fieldMap := make(map[string]*interfaces.Property, len(querySchema))
+	for _, prop := range querySchema {
+		if prop != nil {
+			fieldMap[prop.Name] = prop
+		}
+	}
+	for name, prop := range local_index.GeneratedFields(res.SchemaDefinition) {
+		fieldMap[name] = prop
+	}
+	actualFilterCond, err := filter_condition.NewFilterCondition(ctx, params.FilterCondCfg, fieldMap)
+	if err != nil {
+		span.SetStatus(codes.Error, "Build dataset delete condition failed")
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+			WithErrorDetails(err.Error())
+	}
+	params.ActualFilterCond = actualFilterCond
 	// Call the local index store to batch delete documents
 	if err := ds.lim.DeleteDocumentsByQuery(ctx, res.LocalIndexName, res, params); err != nil {
 		span.SetStatus(codes.Error, "Delete dataset documents failed")
+		if reason, ok := filter_condition.RequestSideQueryError(err); ok {
+			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+				WithErrorDetails(reason)
+		}
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_DeleteFailed).
 			WithErrorDetails(err.Error())
 	}

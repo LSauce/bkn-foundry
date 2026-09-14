@@ -9,8 +9,10 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
+	"vega-backend/common"
 	verrors "vega-backend/errors"
 	"vega-backend/interfaces"
+	"vega-backend/logics/local_index"
 )
 
 type pendingEmbedding struct {
@@ -59,7 +61,7 @@ func (ds *datasetService) materializeDocument(ctx context.Context, res *interfac
 				}
 				continue
 			}
-			outputField := interfaces.LocalIndexVectorFieldName(prop.Name)
+			outputField := local_index.VectorFieldName(prop.Name)
 			if value, exists := result[outputField]; exists {
 				// An explicit vector wins over inference, but validate it before it
 				// reaches OpenSearch.
@@ -133,8 +135,8 @@ func vectorFeatureDimension(config map[string]any, field string) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("vector feature for field %q has no valid dimension", field)
 	}
-	dimension, ok := value.(float64)
-	if !ok || math.IsNaN(dimension) || math.IsInf(dimension, 0) || dimension <= 0 || math.Trunc(dimension) != dimension {
+	dimension, ok := common.NumberAsInt64(value)
+	if !ok || dimension <= 0 || int64(int(dimension)) != dimension {
 		return 0, fmt.Errorf("vector feature for field %q has no valid dimension", field)
 	}
 	return int(dimension), nil

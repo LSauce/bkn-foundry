@@ -2,6 +2,7 @@ package opensearch
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,7 +28,7 @@ func TestOpenSearchConnectorConvertFilterCondition(t *testing.T) {
 		{
 			name: "equal text uses keyword subfield",
 			cfg:  osConstCfg("body", filter_condition.OperationEqual, "hello"),
-			want: map[string]any{"term": map[string]any{"body.raw": "hello"}},
+			want: map[string]any{"term": map[string]any{"body.user-defined-keyword-name": "hello"}},
 		},
 		{
 			name: "not equal wraps must_not",
@@ -175,7 +176,7 @@ func TestOpenSearchConnectorConvertFilterCondition(t *testing.T) {
 		assert.Equal(t, map[string]any{
 			"bool": map[string]any{
 				"should": []map[string]any{
-					{"match": map[string]any{"name.fulltext": "hello"}},
+					{"match": map[string]any{"name.user-defined-fulltext-name": "hello"}},
 					{"match": map[string]any{"body": "hello"}},
 				},
 				"minimum_should_match": 1,
@@ -200,7 +201,7 @@ func TestOpenSearchConnectorConvertFilterCondition(t *testing.T) {
 		assert.Equal(t, map[string]any{
 			"multi_match": map[string]any{
 				"query":  "hello",
-				"fields": []string{"name.fulltext", "body"},
+				"fields": []string{"name.user-defined-fulltext-name", "body"},
 				"type":   "best_fields",
 			},
 		}, got)
@@ -269,6 +270,116 @@ func TestOpenSearchConnectorConvertFilterCondition(t *testing.T) {
 }
 
 func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
+	t.Run("uses each field's own keyword name for field comparison", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		schema := []*interfaces.Property{
+			{Name: "left", OriginalName: "left", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{
+				FeatureName: "raw", FeatureType: interfaces.PropertyFeatureType_Keyword,
+			}}},
+			{Name: "right", OriginalName: "right", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{
+				FeatureName: "exact", FeatureType: interfaces.PropertyFeatureType_Keyword,
+			}}},
+		}
+		fields := map[string]*interfaces.Property{"left": schema[0], "right": schema[1]}
+		for _, operation := range []string{filter_condition.OperationEqual, filter_condition.OperationNotEqual} {
+			cfg := &interfaces.FilterCondCfg{
+				Name: "left", Operation: operation,
+				ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Field, Value: "right"},
+			}
+			cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, fields)
+			require.NoError(t, err)
+
+			got, err := conn.ConvertFilterCondition(cond, schema)
+
+			require.NoError(t, err)
+			operator := "=="
+			if operation == filter_condition.OperationNotEqual {
+				operator = "!="
+			}
+			assert.Equal(t, map[string]any{
+				"script": map[string]any{
+					"source": "doc[params.left].value " + operator + " doc[params.right].value",
+					"params": map[string]any{
+						"left":  "left.raw",
+						"right": "right.exact",
+					},
+				},
+			}, got)
+		}
+	})
+
+	t.Run("passes custom keyword names as script parameters", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		schema := []*interfaces.Property{
+			{Name: "left", OriginalName: "left", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{
+				FeatureName: "ra'w", FeatureType: interfaces.PropertyFeatureType_Keyword,
+			}}},
+			{Name: "right", OriginalName: "right", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{
+				FeatureName: "ex'act", FeatureType: interfaces.PropertyFeatureType_Keyword,
+			}}},
+		}
+		fields := map[string]*interfaces.Property{"left": schema[0], "right": schema[1]}
+		cfg := &interfaces.FilterCondCfg{
+			Name: "left", Operation: filter_condition.OperationEqual,
+			ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Field, Value: "right"},
+		}
+		cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, fields)
+		require.NoError(t, err)
+
+		got, err := conn.ConvertFilterCondition(cond, schema)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{
+			"script": map[string]any{
+				"source": "doc[params.left].value == doc[params.right].value",
+				"params": map[string]any{
+					"left":  "left.ra'w",
+					"right": "right.ex'act",
+				},
+			},
+		}, got)
+	})
+
+	t.Run("uses default keyword name when feature name is empty", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, "hello"))
+		schema := opensearchConditionSchema()
+		schema[1].Features[0].FeatureName = ""
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"term": map[string]any{"body.keyword": "hello"}}, got)
+	})
+
+	t.Run("uses discovered keyword physical name", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, "hello"))
+		schema := opensearchConditionSchema()
+		schema[1].Features[0] = interfaces.PropertyFeature{
+			FeatureName: "body.raw",
+			FeatureType: interfaces.PropertyFeatureType_Keyword,
+			IsNative:    true,
+		}
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"term": map[string]any{"body.raw": "hello"}}, got)
+	})
+
+	t.Run("treats keyword feature matching property name as a subfield", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, "hello"))
+		schema := opensearchConditionSchema()
+		schema[1].Features[0].FeatureName = "body"
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"term": map[string]any{"body.body": "hello"}}, got)
+	})
+
 	t.Run("rejects text field without keyword feature", func(t *testing.T) {
 		conn := &OpenSearchConnector{}
 
@@ -283,7 +394,118 @@ func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, got)
 		assert.ErrorContains(t, err, "no keyword feature")
+		_, ok := filter_condition.AsConditionBuildError(err)
+		assert.True(t, ok)
 	})
+
+	t.Run("rejects exact text values above keyword ignore_above", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, strings.Repeat("字", 257)))
+		schema := opensearchConditionSchema()
+		schema[1].Features[0].Config = map[string]any{"ignore_above": 256}
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.ErrorContains(t, err, "exceeds keyword ignore_above 256")
+		_, ok := filter_condition.AsConditionBuildError(err)
+		assert.True(t, ok)
+	})
+
+	t.Run("rejects exact string values above keyword ignore_above", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("name", filter_condition.OperationEqual, "abcdef"))
+		schema := opensearchConditionSchema()
+		schema[0].Features = append(schema[0].Features, interfaces.PropertyFeature{
+			FeatureName: interfaces.LocalIndexKeywordSubfieldName,
+			FeatureType: interfaces.PropertyFeatureType_Keyword,
+			Config:      map[string]any{"ignore_above": 5},
+		})
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.ErrorContains(t, err, "exceeds keyword ignore_above 5")
+		_, ok := filter_condition.AsConditionBuildError(err)
+		assert.True(t, ok)
+	})
+
+	t.Run("rejects oversized exact text value when original name is empty", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, strings.Repeat("字", 257)))
+		schema := opensearchConditionSchema()
+		schema[1].OriginalName = ""
+		schema[1].Features[0].Config = map[string]any{"ignore_above": 256}
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.ErrorContains(t, err, "exceeds keyword ignore_above 256")
+		_, ok := filter_condition.AsConditionBuildError(err)
+		assert.True(t, ok)
+	})
+
+	t.Run("counts supplementary characters as UTF-16 code units", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		cond := mustOSCondition(t, osConstCfg("body", filter_condition.OperationEqual, "😀"))
+		schema := opensearchConditionSchema()
+		schema[1].Features[0].Config = map[string]any{"ignore_above": int32(1)}
+
+		got, err := conn.ConvertFilterConditionEqual(cond, schema)
+
+		require.Error(t, err)
+		assert.Nil(t, got)
+		assert.ErrorContains(t, err, "exceeds keyword ignore_above 1")
+	})
+}
+
+func TestOpenSearchConnectorConvertFilterConditionOrderedFieldComparison(t *testing.T) {
+	conn := &OpenSearchConnector{}
+	schema := []*interfaces.Property{
+		{Name: "left", OriginalName: "le'ft", Type: interfaces.DataType_Integer},
+		{Name: "right", OriginalName: "ri'ght", Type: interfaces.DataType_Integer},
+	}
+	fields := map[string]*interfaces.Property{"left": schema[0], "right": schema[1]}
+	tests := []struct {
+		operation string
+		operator  string
+	}{
+		{operation: filter_condition.OperationGt, operator: ">"},
+		{operation: filter_condition.OperationGte, operator: ">="},
+		{operation: filter_condition.OperationLt, operator: "<"},
+		{operation: filter_condition.OperationLte, operator: "<="},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.operation, func(t *testing.T) {
+			cfg := &interfaces.FilterCondCfg{
+				Name:      "left",
+				Operation: tt.operation,
+				ValueOptCfg: interfaces.ValueOptCfg{
+					ValueFrom: interfaces.ValueFrom_Field,
+					Value:     "right",
+				},
+			}
+			cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, fields)
+			require.NoError(t, err)
+
+			got, err := conn.ConvertFilterCondition(cond, schema)
+
+			require.NoError(t, err)
+			assert.Equal(t, map[string]any{
+				"script": map[string]any{
+					"source": "doc[params.left].value " + tt.operator + " doc[params.right].value",
+					"params": map[string]any{
+						"left":  "le'ft",
+						"right": "ri'ght",
+					},
+				},
+			}, got)
+		})
+	}
 }
 
 func TestOpenSearchConnectorConvertFilterConditionAnd(t *testing.T) {
@@ -334,7 +556,7 @@ func opensearchConditionSchema() []*interfaces.Property {
 			OriginalName: "name",
 			Type:         interfaces.DataType_String,
 			Features: []interfaces.PropertyFeature{
-				{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+				{FeatureName: "user-defined-fulltext-name", FeatureType: interfaces.PropertyFeatureType_Fulltext},
 			},
 		},
 		{
@@ -342,7 +564,7 @@ func opensearchConditionSchema() []*interfaces.Property {
 			OriginalName: "body",
 			Type:         interfaces.DataType_Text,
 			Features: []interfaces.PropertyFeature{
-				{FeatureName: "raw", FeatureType: interfaces.PropertyFeatureType_Keyword},
+				{FeatureName: "user-defined-keyword-name", FeatureType: interfaces.PropertyFeatureType_Keyword},
 			},
 		},
 		{Name: "age", OriginalName: "age", Type: interfaces.DataType_Integer},
@@ -358,17 +580,54 @@ func TestFulltextFieldName(t *testing.T) {
 			Name: "team_name",
 			Type: interfaces.DataType_String,
 			Features: []interfaces.PropertyFeature{
-				{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+				{FeatureName: "user-defined-name", FeatureType: interfaces.PropertyFeatureType_Fulltext},
 			},
 		}
 
-		assert.Equal(t, "team_name.fulltext", fulltextFieldName(prop))
+		assert.Equal(t, "team_name.user-defined-name", fulltextFieldName(prop))
+	})
+
+	t.Run("fulltext field name accepts discovered physical name", func(t *testing.T) {
+		prop := &interfaces.Property{
+			Name:         "teamName",
+			OriginalName: "team_name",
+			Type:         interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{
+				{FeatureName: "team_name.analyzed", FeatureType: interfaces.PropertyFeatureType_Fulltext, IsNative: true},
+			},
+		}
+
+		assert.Equal(t, "team_name.analyzed", fulltextFieldName(prop))
+	})
+
+	t.Run("fulltext feature matching property name remains a subfield", func(t *testing.T) {
+		prop := &interfaces.Property{
+			Name: "team_name",
+			Type: interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{
+				{FeatureName: "team_name", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			},
+		}
+
+		assert.Equal(t, "team_name.team_name", fulltextFieldName(prop))
 	})
 
 	t.Run("fulltext field name text uses bare name", func(t *testing.T) {
 		prop := &interfaces.Property{Name: "body", Type: interfaces.DataType_Text}
 
 		assert.Equal(t, "body", fulltextFieldName(prop))
+	})
+
+	t.Run("fulltext field name uses default when feature name is empty", func(t *testing.T) {
+		prop := &interfaces.Property{
+			Name: "team_name",
+			Type: interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			},
+		}
+
+		assert.Equal(t, "team_name.fulltext", fulltextFieldName(prop))
 	})
 
 	t.Run("fulltext field name string no fulltext bare name", func(t *testing.T) {

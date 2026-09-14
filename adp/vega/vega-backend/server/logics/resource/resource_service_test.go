@@ -9,6 +9,7 @@ package resource
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -117,6 +118,53 @@ func TestValidateSchemaDefinitionRejectsDuplicateFeatureTypes(t *testing.T) {
 
 	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
 	assert.Contains(t, httpErr.BaseError.ErrorDetails, `property "code" has more than one "keyword" feature`)
+}
+
+func TestValidateSchemaDefinitionRejectsDefaultFeatureNameCollision(t *testing.T) {
+	schema := []*interfaces.Property{{
+		Name: "body",
+		Type: interfaces.DataType_Text,
+		Features: []interfaces.PropertyFeature{{
+			FeatureName: interfaces.LocalIndexKeywordSubfieldName,
+			FeatureType: interfaces.PropertyFeatureType_Fulltext,
+		}},
+	}}
+	AddDefaultStringAndTextFeatures(schema, nil)
+
+	err := validateSchemaDefinition(context.Background(), schema)
+
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `property "body" has more than one feature named "keyword"`)
+}
+
+func TestValidateSchemaDefinitionRejectsQualifiedFeatureName(t *testing.T) {
+	err := validateSchemaDefinition(context.Background(), []*interfaces.Property{{
+		Name: "title",
+		Type: interfaces.DataType_Text,
+		Features: []interfaces.PropertyFeature{{
+			FeatureName: "title.keyword",
+			FeatureType: interfaces.PropertyFeatureType_Keyword,
+		}},
+	}})
+
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `feature name "title.keyword" must be relative to property "title"`)
+}
+
+func TestValidateLocalIndexVectorOutputs(t *testing.T) {
+	err := validateLocalIndexVectorOutputs(context.Background(), []*interfaces.Property{
+		{
+			Name: "content",
+			Type: interfaces.DataType_Text,
+			Features: []interfaces.PropertyFeature{{
+				FeatureType: interfaces.PropertyFeatureType_Vector,
+			}},
+		},
+		{Name: "content_vector", Type: interfaces.DataType_String},
+	})
+
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `generated vector field "content_vector" conflicts with a logical property "content_vector"`)
 }
 
 func TestResourceServiceInternalMetadataUpdateConflict(t *testing.T) {
@@ -261,12 +309,18 @@ func TestResourceServiceCheckExistByName(t *testing.T) {
 func TestResourceServiceGetByID(t *testing.T) {
 	t.Run("trusted proxy read skips secondary metadata authorization", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		want := &interfaces.Resource{ID: "r1", CatalogID: "cat-user"}
+		want := &interfaces.Resource{
+			ID:               "r1",
+			CatalogID:        "cat-user",
+			SchemaDefinition: []*interfaces.Property{{Name: "id"}, {Name: "name"}},
+		}
 		mockRA.EXPECT().GetByID(gomock.Any(), nil, "r1").Return(want, nil)
 
 		got, err := rs.GetByID(interfaces.WithTrustedProxyRead(context.Background()), "r1")
 		require.NoError(t, err)
 		assert.Same(t, want, got)
+		require.NotNil(t, got.ColumnCount)
+		assert.Equal(t, 2, *got.ColumnCount)
 	})
 
 	t.Run("keeps resource when account name lookup fails", func(t *testing.T) {
@@ -287,6 +341,23 @@ func TestResourceServiceGetByID(t *testing.T) {
 		if resource.ID != "r1" {
 			t.Errorf("expected ID 'r1', got '%s'", resource.ID)
 		}
+	})
+	t.Run("does not query dataset row count for generic service reads", func(t *testing.T) {
+		rs, mockRA, mockPS, _, mockUMS, _, _ := newTestService(t)
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "dataset-1").
+			Return(&interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset}, nil)
+		mockPS.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE,
+			[]string{"dataset-1"}, gomock.Any(), true, gomock.Any()).
+			Return(map[string]interfaces.PermissionResourceOps{
+				"dataset-1": {ResourceID: "dataset-1", Operations: []string{"view_detail"}},
+			}, nil)
+		mockUMS.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
+
+		resource, err := rs.GetByID(context.Background(), "dataset-1")
+
+		require.NoError(t, err)
+		assert.Nil(t, resource.ColumnCount)
+		assert.Nil(t, resource.RowCount)
 	})
 	t.Run("get by idnot found", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
@@ -365,12 +436,90 @@ func TestResourceServiceGetByID(t *testing.T) {
 func TestResourceServiceGetByIDs(t *testing.T) {
 	t.Run("trusted proxy read skips secondary metadata authorization", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		want := []*interfaces.Resource{{ID: "r1", CatalogID: "cat-user"}}
+		want := []*interfaces.Resource{{
+			ID:               "r1",
+			CatalogID:        "cat-user",
+			SchemaDefinition: []*interfaces.Property{{Name: "id"}},
+		}}
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).Return(want, nil)
 
-		got, err := rs.GetByIDs(interfaces.WithTrustedProxyRead(context.Background()), []string{"r1"})
+		got, err := rs.GetByIDs(interfaces.WithTrustedProxyRead(context.Background()), []string{"r1"}, false)
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
+		require.NotNil(t, got[0].ColumnCount)
+		assert.Equal(t, 1, *got[0].ColumnCount)
+	})
+
+	t.Run("includes metadata and dataset row counts when requested", func(t *testing.T) {
+		rs, mockRA, _, mockDS, _, _, _ := newTestService(t)
+		table := &interfaces.Resource{
+			ID:             "table-1",
+			Category:       interfaces.ResourceCategoryTable,
+			SourceMetadata: map[string]any{"properties": map[string]any{"row_count": float64(42)}},
+		}
+		fileset := &interfaces.Resource{
+			ID:             "fileset-1",
+			Category:       interfaces.ResourceCategoryFileset,
+			SourceMetadata: map[string]any{"properties": map[string]any{"row_count": json.Number("9007199254740993")}},
+		}
+		withoutMetadata := &interfaces.Resource{ID: "api-1", Category: interfaces.ResourceCategoryAPI}
+		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset}
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"table-1", "fileset-1", "api-1", "dataset-1"}).
+			Return([]*interfaces.Resource{table, fileset, withoutMetadata, dataset}, nil)
+		mockDS.EXPECT().CountDocuments(gomock.Any(), dataset).Return(int64(7), nil)
+
+		resources, err := rs.GetByIDs(
+			interfaces.WithTrustedProxyRead(context.Background()),
+			[]string{"table-1", "fileset-1", "api-1", "dataset-1"},
+			true,
+		)
+
+		require.NoError(t, err)
+		require.NotNil(t, resources[0].RowCount)
+		assert.Equal(t, int64(42), *resources[0].RowCount)
+		require.NotNil(t, resources[1].RowCount)
+		assert.Equal(t, int64(9007199254740993), *resources[1].RowCount)
+		assert.Nil(t, resources[2].RowCount)
+		require.NotNil(t, resources[3].RowCount)
+		assert.Equal(t, int64(7), *resources[3].RowCount)
+	})
+
+	t.Run("omits table and dataset row counts when not requested", func(t *testing.T) {
+		rs, mockRA, _, _, _, _, _ := newTestService(t)
+		tableRows := int64(42)
+		datasetRows := int64(7)
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"table-1", "dataset-1"}).
+			Return([]*interfaces.Resource{
+				{ID: "table-1", Category: interfaces.ResourceCategoryTable, RowCount: &tableRows},
+				{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset, RowCount: &datasetRows},
+			}, nil)
+
+		resources, err := rs.GetByIDs(
+			interfaces.WithTrustedProxyRead(context.Background()),
+			[]string{"table-1", "dataset-1"},
+			false,
+		)
+
+		require.NoError(t, err)
+		assert.Nil(t, resources[0].RowCount)
+		assert.Nil(t, resources[1].RowCount)
+	})
+
+	t.Run("keeps dataset details available when counting rows fails", func(t *testing.T) {
+		rs, mockRA, _, mockDS, _, _, _ := newTestService(t)
+		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset}
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"dataset-1"}).
+			Return([]*interfaces.Resource{dataset}, nil)
+		mockDS.EXPECT().CountDocuments(gomock.Any(), dataset).Return(int64(0), errors.New("count failed"))
+
+		resources, err := rs.GetByIDs(
+			interfaces.WithTrustedProxyRead(context.Background()),
+			[]string{"dataset-1"},
+			true,
+		)
+
+		require.NoError(t, err)
+		assert.Nil(t, resources[0].RowCount)
 	})
 
 	t.Run("get by ids success", func(t *testing.T) {
@@ -385,7 +534,7 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 			}, nil)
 		mockUMS.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
 
-		resources, err := rs.GetByIDs(context.Background(), []string{"r1", "r2"})
+		resources, err := rs.GetByIDs(context.Background(), []string{"r1", "r2"}, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -393,6 +542,73 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 			t.Errorf("expected 2 resources, got %d", len(resources))
 		}
 	})
+}
+
+func TestResourceUpdateUsesFeatureSemanticsForEverySupportedCategory(t *testing.T) {
+	current := []interfaces.PropertyFeature{
+		{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+		{
+			FeatureName: "keyword",
+			FeatureType: interfaces.PropertyFeatureType_Keyword,
+			Config:      map[string]any{"ignore_above": 256},
+		},
+	}
+	requested := []interfaces.PropertyFeature{
+		{
+			FeatureName: "keyword",
+			FeatureType: interfaces.PropertyFeatureType_Keyword,
+			Description: "Exact match",
+			IsDefault:   true,
+			Config:      map[string]any{"ignore_above": 256},
+		},
+		{
+			FeatureName: "fulltext",
+			FeatureType: interfaces.PropertyFeatureType_Fulltext,
+			Description: "Search",
+			IsDefault:   true,
+			IsNative:    true,
+		},
+	}
+
+	for _, category := range []string{
+		interfaces.ResourceCategoryTable,
+		interfaces.ResourceCategoryDataset,
+	} {
+		t.Run(category, func(t *testing.T) {
+			changed, err := (&resourceService{}).validateResourceUpdateScope(
+				context.Background(),
+				&interfaces.Resource{
+					CatalogID: "catalog-1",
+					Category:  category,
+					SchemaDefinition: []*interfaces.Property{{
+						Name: "content", Type: interfaces.DataType_Text, Features: current,
+					}},
+				},
+				&interfaces.ResourceRequest{
+					CatalogID: "catalog-1",
+					Category:  category,
+					SchemaDefinition: []*interfaces.Property{{
+						Name: "content", Type: interfaces.DataType_Text, Features: requested,
+					}},
+				},
+			)
+
+			require.NoError(t, err)
+			assert.False(t, changed)
+		})
+	}
+}
+
+func TestSourceMetadataRowCountHandlesMissingMetadata(t *testing.T) {
+	for _, metadata := range []map[string]any{
+		nil,
+		{},
+		{"properties": map[string]any{}},
+	} {
+		count, ok := sourceMetadataRowCount(metadata)
+		assert.False(t, ok)
+		assert.Zero(t, count)
+	}
 }
 
 func TestResourceServiceGetByCatalogID(t *testing.T) {
@@ -443,7 +659,10 @@ func TestResourceServiceList(t *testing.T) {
 	t.Run("list return all", func(t *testing.T) {
 		rs, mockRA, mockPS, _, mockUMS, _, _ := newTestService(t)
 		refs := []interfaces.ResourcePermissionRef{{ResourceID: "c1"}, {ResourceID: "c2"}}
-		summaries := []*interfaces.ResourceSummary{{ID: "r1"}, {ID: "r2"}}
+		summaries := []*interfaces.ResourceSummary{
+			{ID: "r1", Category: interfaces.ResourceCategoryDataset, LocalIndexName: "index-1"},
+			{ID: "r2"},
+		}
 		mockRA.EXPECT().ListPermissionRefs(gomock.Any(), gomock.Any()).Return(refs, nil)
 		mockPS.EXPECT().FilterResources(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), true, gomock.Any()).
 			Return(map[string]interfaces.PermissionResourceOps{
@@ -615,6 +834,68 @@ func requireResourceHTTPError(t *testing.T, err error, wantCode string) *rest.HT
 	return httpErr
 }
 
+func TestResourceServiceValidateIndexConfigModelsRejectsReferencedVectorConfig(t *testing.T) {
+	rs := &resourceService{}
+	schema := []*interfaces.Property{
+		{
+			Name: "content",
+			Type: interfaces.DataType_Text,
+			Features: []interfaces.PropertyFeature{{
+				FeatureType: interfaces.PropertyFeatureType_Vector,
+				RefProperty: "embedding",
+				Config:      map[string]any{"embedding_model": "content-model"},
+			}},
+		},
+		{
+			Name: "embedding",
+			Type: interfaces.DataType_Vector,
+			Features: []interfaces.PropertyFeature{{
+				FeatureType: interfaces.PropertyFeatureType_Vector,
+				Config:      map[string]any{"embedding_model": "embedding-model"},
+			}},
+		},
+	}
+
+	err := rs.validateIndexConfigModels(context.Background(), schema, nil)
+
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `vector feature on field "content" that references "embedding" must not define config`)
+}
+
+func TestValidateKeywordConfig(t *testing.T) {
+	t.Run("accepts boundary values", func(t *testing.T) {
+		minimum, maximum := 1, interfaces.MaxKeywordIgnoreAbove
+		for _, value := range []*int{&minimum, &maximum} {
+			err := validateKeywordConfig(context.Background(), []*interfaces.Property{{
+				Name: "title", Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Keyword,
+					Config:      map[string]any{"ignore_above": *value},
+				}},
+			}}, &interfaces.ResourceIndexConfig{DefaultKeywordIgnoreAbove: value})
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("rejects invalid resource and field values", func(t *testing.T) {
+		zero := 0
+		err := validateKeywordConfig(context.Background(), nil,
+			&interfaces.ResourceIndexConfig{DefaultKeywordIgnoreAbove: &zero})
+		assert.Error(t, err)
+
+		for _, value := range []any{0, 1.5, 8192} {
+			err = validateKeywordConfig(context.Background(), []*interfaces.Property{{
+				Name: "title", Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Keyword,
+					Config:      map[string]any{"ignore_above": value},
+				}},
+			}}, nil)
+			assert.Error(t, err)
+		}
+	})
+}
+
 func TestValidateSchemaDefinitionRejectsNullField(t *testing.T) {
 	err := validateSchemaDefinition(context.Background(), []*interfaces.Property{{Name: "id"}, nil})
 
@@ -629,12 +910,23 @@ func TestResourceServiceCreate(t *testing.T) {
 		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), gomock.Any()).Return(true, nil)
 		mockRA.EXPECT().Create(gomock.Any(), gomock.Not(nil), gomock.Any()).Return(nil)
-		mockDS.EXPECT().Create(gomock.Any(), gomock.Any()).Return(nil)
+		mockDS.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, got *interfaces.Resource) error {
+				require.Len(t, got.SchemaDefinition, 2)
+				require.Len(t, got.SchemaDefinition[0].Features, 1)
+				assert.Equal(t, interfaces.PropertyFeatureType_Keyword, got.SchemaDefinition[0].Features[0].FeatureType)
+				require.Len(t, got.SchemaDefinition[1].Features, 2)
+				return nil
+			})
 		mockPS.EXPECT().CreateResources(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 		resource, err := rs.Create(context.Background(), &interfaces.ResourceRequest{
 			Name:     "test-dataset",
 			Category: interfaces.ResourceCategoryDataset,
+			SchemaDefinition: []*interfaces.Property{
+				{Name: "code", Type: interfaces.DataType_String},
+				{Name: "body", Type: interfaces.DataType_Text},
+			},
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -661,6 +953,31 @@ func TestResourceServiceCreate(t *testing.T) {
 		if resource == nil {
 			t.Error("expected non-empty ID")
 		}
+	})
+	t.Run("create table adds required default features to text fields", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, mockCS, _ := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), gomock.Any()).Return(true, nil)
+		mockRA.EXPECT().Create(gomock.Any(), gomock.Not(nil), gomock.Any()).Return(nil)
+		mockPS.EXPECT().CreateResources(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+		resource, err := rs.Create(context.Background(), &interfaces.ResourceRequest{
+			Name:     "test-resource",
+			Category: interfaces.ResourceCategoryTable,
+			SchemaDefinition: []*interfaces.Property{{
+				Name: "body",
+				Type: interfaces.DataType_Text,
+			}},
+		})
+
+		require.NoError(t, err)
+		require.Len(t, resource.SchemaDefinition[0].Features, 2)
+		keyword := resource.SchemaDefinition[0].Features[0]
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, keyword.FeatureType)
+		assert.Equal(t, interfaces.LocalIndexKeywordSubfieldName, keyword.FeatureName)
+		assert.Equal(t, interfaces.DefaultTextKeywordIgnoreAbove, keyword.Config["ignore_above"])
+		assert.Equal(t, interfaces.PropertyFeatureType_Fulltext, resource.SchemaDefinition[0].Features[1].FeatureType)
 	})
 	t.Run("create with explicit id", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, mockCS, _ := newTestService(t)
@@ -1037,6 +1354,48 @@ func TestResourceServiceUpdateDiscoverStatus(t *testing.T) {
 }
 
 func TestResourceServiceUpdate(t *testing.T) {
+	t.Run("allows dataset feature metadata and order changes without rebuilding the index", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, mockCS, _ := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
+		resource := &interfaces.Resource{
+			ID:             "r1",
+			CatalogID:      "cat1",
+			Category:       interfaces.ResourceCategoryDataset,
+			Name:           "dataset",
+			LocalIndexName: "vega-dataset-index-1",
+			SchemaDefinition: []*interfaces.Property{{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{
+					{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+					{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, Config: map[string]any{"ignore_above": 256}},
+				},
+			}},
+		}
+		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), resource, int64(1)).Return(int64(1), nil)
+
+		err := rs.Update(context.Background(), resource, &interfaces.ResourceRequest{
+			CatalogID:          "cat1",
+			Category:           interfaces.ResourceCategoryDataset,
+			Name:               "dataset",
+			Enabled:            resource.Enabled,
+			ExpectedUpdateTime: 1,
+			SchemaDefinition: []*interfaces.Property{{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{
+					{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, Description: "Exact match", IsDefault: true, Config: map[string]any{"ignore_above": 256}},
+					{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext, Description: "Search", IsDefault: true, IsNative: true},
+				},
+			}},
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "Exact match", resource.SchemaDefinition[0].Features[0].Description)
+	})
+
 	t.Run("update nil resource", func(t *testing.T) {
 		rs, _, _, _, _, _, _ := newTestService(t)
 		err := rs.Update(context.Background(), nil, &interfaces.ResourceRequest{})
@@ -1060,6 +1419,55 @@ func TestResourceServiceUpdate(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+	t.Run("re-saving a table persists the default keyword feature for text fields", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, mockCS, mockBTA := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
+		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).
+			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) (int64, error) {
+				require.Len(t, got.SchemaDefinition, 1)
+				require.Len(t, got.SchemaDefinition[0].Features, 2)
+				keyword := got.SchemaDefinition[0].Features[1]
+				assert.Equal(t, interfaces.PropertyFeatureType_Keyword, keyword.FeatureType)
+				assert.Equal(t, interfaces.LocalIndexKeywordSubfieldName, keyword.FeatureName)
+				assert.Equal(t, interfaces.DefaultTextKeywordIgnoreAbove, keyword.Config["ignore_above"])
+				return 1, nil
+			})
+
+		resource := &interfaces.Resource{
+			ID:               "r1",
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
+			Name:             "table",
+			SourceIdentifier: "public.materials",
+			SchemaDefinition: []*interfaces.Property{{
+				Name: "material_number",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureName: "fulltext",
+					FeatureType: interfaces.PropertyFeatureType_Fulltext,
+				}},
+			}},
+		}
+		err := rs.Update(context.Background(), resource, &interfaces.ResourceRequest{
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
+			Name:             "table",
+			SourceIdentifier: "public.materials",
+			SchemaDefinition: []*interfaces.Property{{
+				Name: "material_number",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureName: "fulltext",
+					FeatureType: interfaces.PropertyFeatureType_Fulltext,
+				}},
+			}},
+		})
+
+		require.NoError(t, err)
+	})
 	t.Run("updates dataset index mapping before persisting a schema change", func(t *testing.T) {
 		rs, mockRA, mockPS, mockDS, _, mockCS, mockBTA := newTestService(t)
 		expectResourceServiceTransaction(t, rs, true)
@@ -1067,12 +1475,15 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		resource := &interfaces.Resource{
-			ID:               "r1",
-			CatalogID:        "cat1",
-			Category:         interfaces.ResourceCategoryDataset,
-			Name:             "dataset",
-			LocalIndexName:   "vega-dataset-index-1",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			ID:             "r1",
+			CatalogID:      "cat1",
+			Category:       interfaces.ResourceCategoryDataset,
+			Name:           "dataset",
+			LocalIndexName: "vega-dataset-index-1",
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		}
 		mockDS.EXPECT().ListDocuments(gomock.Any(), resource, gomock.Any()).
 			DoAndReturn(func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
@@ -1137,12 +1548,15 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		resource := &interfaces.Resource{
-			ID:               "r1",
-			CatalogID:        "cat1",
-			Category:         interfaces.ResourceCategoryDataset,
-			Name:             "dataset",
-			LocalIndexName:   "vega-dataset-index-1",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			ID:             "r1",
+			CatalogID:      "cat1",
+			Category:       interfaces.ResourceCategoryDataset,
+			Name:           "dataset",
+			LocalIndexName: "vega-dataset-index-1",
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		}
 		mockDS.EXPECT().ListDocuments(gomock.Any(), resource, gomock.Any()).Return(nil, int64(0), nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), resource, int64(42)).Return(int64(0), nil)
@@ -1303,14 +1717,20 @@ func TestResourceServiceUpdate(t *testing.T) {
 			LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
 			SyncMark:         `{"mode":"batch","cursor":[]}`,
 			SourceIdentifier: "public.orders",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
 			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			Description:      "new",
 			SourceIdentifier: "public.orders",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1333,7 +1753,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 				if got.LocalIndexName != "vega-build-r1-task-1" {
 					t.Fatalf("expected LocalIndexName to be preserved, got %q", got.LocalIndexName)
 				}
-				if len(got.SchemaDefinition) != 1 || len(got.SchemaDefinition[0].Features) != 1 {
+				if len(got.SchemaDefinition) != 1 || len(got.SchemaDefinition[0].Features) != 2 {
 					t.Fatalf("expected updated schema features, got %#v", got.SchemaDefinition)
 				}
 				return 1, nil
@@ -1352,7 +1772,10 @@ func TestResourceServiceUpdate(t *testing.T) {
 			LocalIndexName:   "vega-build-r1-task-1",
 			SyncMark:         `{"mode":"batch","cursor":[1]}`,
 			SourceIdentifier: "public.orders",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
 			Category:         interfaces.ResourceCategoryTable,
@@ -1370,6 +1793,49 @@ func TestResourceServiceUpdate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+	})
+	t.Run("update marks local index stale when key fields and schema features both change", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, mockCS, mockBTA := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
+		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).Return(int64(1), nil)
+		mockRA.EXPECT().UpdateLocalIndexState(
+			gomock.Any(), gomock.Not(nil), "r1",
+			interfaces.ResourceLocalIndexStatusStale,
+			"vega-build-r1-task-1", "",
+		).Return(true, nil)
+
+		err := rs.Update(context.Background(), &interfaces.Resource{
+			ID:               "r1",
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
+			Name:             "table",
+			LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+			LocalIndexName:   "vega-build-r1-task-1",
+			SyncMark:         `{"mode":"batch","cursor":[1]}`,
+			SourceIdentifier: "public.orders",
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
+			IndexConfig: &interfaces.ResourceIndexConfig{
+				PrimaryKeyFields: []string{"id"}, IncrementalFields: []string{"id"},
+			},
+		}, &interfaces.ResourceRequest{
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
+			Name:             "table",
+			SourceIdentifier: "public.orders",
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext,
+			}}}},
+			IndexConfig: &interfaces.ResourceIndexConfig{
+				PrimaryKeyFields: []string{"id"}, IncrementalFields: nil,
+			},
+		})
+		require.NoError(t, err)
 	})
 	t.Run("update rejects index config change when active build task exists", func(t *testing.T) {
 		rs, _, mockPS, _, _, _, mockBTA := newTestService(t)
@@ -1611,7 +2077,10 @@ func TestResourceServiceUpdate(t *testing.T) {
 			Name:             "table",
 			LocalIndexName:   "vega-build-r1-task-1",
 			SourceIdentifier: "public.orders",
-			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{
+				FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+			}}}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
 			Category:         interfaces.ResourceCategoryTable,
@@ -1622,6 +2091,10 @@ func TestResourceServiceUpdate(t *testing.T) {
 				DisplayName: "Order ID",
 				Type:        interfaces.DataType_String,
 				Description: "business id",
+				Features: []interfaces.PropertyFeature{{
+					FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword,
+					Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove},
+				}},
 			}},
 		})
 		if err != nil {

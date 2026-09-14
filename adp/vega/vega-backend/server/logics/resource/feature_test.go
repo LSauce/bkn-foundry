@@ -16,6 +16,77 @@ import (
 	"vega-backend/interfaces"
 )
 
+func TestValidateVectorFeatureReferences(t *testing.T) {
+	t.Run("accepts reference without its own config", func(t *testing.T) {
+		schema := []*interfaces.Property{
+			{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					RefProperty: "embedding",
+				}},
+			},
+			{
+				Name: "embedding",
+				Type: interfaces.DataType_Vector,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					Config:      map[string]any{"dimension": float64(768)},
+				}},
+			},
+		}
+
+		require.NoError(t, ValidateVectorFeatureReferences(schema))
+	})
+
+	t.Run("rejects config owned by a referencing feature", func(t *testing.T) {
+		schema := []*interfaces.Property{
+			{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					RefProperty: "embedding",
+					Config:      map[string]any{"embedding_model": "model-1"},
+				}},
+			},
+			{
+				Name: "embedding",
+				Type: interfaces.DataType_Vector,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					Config:      map[string]any{"dimension": uint16(768)},
+				}},
+			},
+		}
+
+		err := ValidateVectorFeatureReferences(schema)
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, `vector feature on field "content" that references "embedding" must not define config`)
+	})
+
+	t.Run("requires the referenced field own vector dimension", func(t *testing.T) {
+		schema := []*interfaces.Property{
+			{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					RefProperty: "embedding",
+				}},
+			},
+			{Name: "embedding", Type: interfaces.DataType_Vector},
+		}
+
+		err := ValidateVectorFeatureReferences(schema)
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, `referenced vector field "embedding" must define its own positive integer dimension`)
+	})
+}
+
 func TestIsFeatureSupported(t *testing.T) {
 	tests := []struct {
 		propertyType string
@@ -75,6 +146,86 @@ func TestNormalizeSelfReferencingFeatures(t *testing.T) {
 
 	t.Run("tolerates nil properties", func(t *testing.T) {
 		assert.NotPanics(t, func() { NormalizeSelfReferencingFeatures([]*interfaces.Property{nil}) })
+	})
+}
+
+func TestAddDefaultStringAndTextFeatures(t *testing.T) {
+	t.Run("adds keyword to string and keyword plus fulltext to text", func(t *testing.T) {
+		limit := 512
+		props := []*interfaces.Property{
+			{Name: "code", Type: interfaces.DataType_String},
+			{Name: "body", Type: interfaces.DataType_Text},
+		}
+
+		AddDefaultStringAndTextFeatures(props, &interfaces.ResourceIndexConfig{DefaultKeywordIgnoreAbove: &limit})
+
+		require.Len(t, props[0].Features, 1)
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, props[0].Features[0].FeatureType)
+		assert.Equal(t, 512, props[0].Features[0].Config["ignore_above"])
+		require.Len(t, props[1].Features, 2)
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, props[1].Features[0].FeatureType)
+		assert.Equal(t, interfaces.PropertyFeatureType_Fulltext, props[1].Features[1].FeatureType)
+		assert.True(t, props[1].Features[0].IsDefault)
+		assert.True(t, props[1].Features[1].IsDefault)
+		assert.Empty(t, FieldsWithoutRequiredDefaultFeatures(props))
+	})
+
+	t.Run("preserves an explicitly configured keyword feature", func(t *testing.T) {
+		props := []*interfaces.Property{{
+			Name: "body",
+			Type: interfaces.DataType_Text,
+			Features: []interfaces.PropertyFeature{{
+				FeatureName: "raw",
+				FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config:      map[string]any{"ignore_above": 128},
+			}},
+		}}
+
+		AddDefaultStringAndTextFeatures(props, nil)
+
+		require.Len(t, props[0].Features, 2)
+		assert.Equal(t, "raw", props[0].Features[0].FeatureName)
+		assert.Equal(t, 128, props[0].Features[0].Config["ignore_above"])
+		assert.Equal(t, interfaces.PropertyFeatureType_Fulltext, props[0].Features[1].FeatureType)
+	})
+
+	t.Run("fills a missing keyword limit without replacing custom feature names", func(t *testing.T) {
+		limit := 512
+		props := []*interfaces.Property{{
+			Name: "body",
+			Type: interfaces.DataType_Text,
+			Features: []interfaces.PropertyFeature{
+				{FeatureName: "raw", FeatureType: interfaces.PropertyFeatureType_Keyword},
+				{FeatureName: "search", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			},
+		}}
+
+		AddDefaultStringAndTextFeatures(props, &interfaces.ResourceIndexConfig{DefaultKeywordIgnoreAbove: &limit})
+
+		require.Len(t, props[0].Features, 2)
+		assert.Equal(t, "raw", props[0].Features[0].FeatureName)
+		assert.Equal(t, 512, props[0].Features[0].Config["ignore_above"])
+		assert.Equal(t, "search", props[0].Features[1].FeatureName)
+	})
+
+	t.Run("reports all required features missing from legacy string and text fields", func(t *testing.T) {
+		fields := FieldsWithoutRequiredDefaultFeatures([]*interfaces.Property{
+			{Name: "code", Type: interfaces.DataType_String},
+			{Name: "body", Type: interfaces.DataType_Text},
+			{Name: "title", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.PropertyFeatureType_Keyword, Config: map[string]any{"ignore_above": 256}},
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			}},
+			{Name: "legacy", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.PropertyFeatureType_Keyword},
+			}},
+		})
+
+		assert.Equal(t, []string{
+			"code (keyword)",
+			"body (keyword, fulltext)",
+			"legacy (keyword config.ignore_above)",
+		}, fields)
 	})
 }
 

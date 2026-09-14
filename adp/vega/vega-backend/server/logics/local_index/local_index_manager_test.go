@@ -157,12 +157,15 @@ func TestLocalIndexManagerDelegatesToIndexConnector(t *testing.T) {
 		}
 		document := map[string]any{"id": 1}
 		docIDs := []string{"doc-1"}
+		properties := map[string]any{
+			"id": map[string]any{"type": "long"},
+		}
 
-		connector.EXPECT().CreateIndex(ctx, "idx", schema, nil).Return(nil)
-		connector.EXPECT().UpdateIndex(ctx, "idx", schema).Return(nil)
+		connector.EXPECT().CreateIndex(ctx, "idx", properties, nil).Return(nil)
+		connector.EXPECT().UpdateIndex(ctx, "idx", properties).Return(nil)
 		connector.EXPECT().DeleteIndex(ctx, "idx").Return(nil)
 		connector.EXPECT().CheckIndexExist(ctx, "idx").Return(true, nil)
-		connector.EXPECT().ExecuteQuery(ctx, "idx", resource, params).Return(queryResult, nil)
+		connector.EXPECT().ExecuteQuery(ctx, "idx", resourceForQuery(resource), params).Return(queryResult, nil)
 		connector.EXPECT().GetDocument(ctx, "idx", "doc-1").Return(document, nil)
 		connector.EXPECT().GetDocuments(ctx, "idx", []string{"doc-1", "missing"}).Return([]map[string]any{document, nil}, nil)
 		connector.EXPECT().CreateDocuments(ctx, "idx", docs).Return(docIDs, nil)
@@ -205,8 +208,8 @@ func TestLocalIndexManagerDelegatesToIndexConnector(t *testing.T) {
 	})
 }
 
-func TestLocalIndexManagerDeleteDocumentsByQueryBuildsActualFilter(t *testing.T) {
-	t.Run("local index manager delete documents by query builds actual filter", func(t *testing.T) {
+func TestLocalIndexManagerDeleteDocumentsByQueryDelegatesToConnector(t *testing.T) {
+	t.Run("local index manager delegates a prepared delete query", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
 		ctx := context.Background()
@@ -228,7 +231,7 @@ func TestLocalIndexManagerDeleteDocumentsByQueryBuildsActualFilter(t *testing.T)
 		var gotParams *interfaces.ResourceDataQueryParams
 		var gotSchema []*interfaces.Property
 		connector.EXPECT().
-			DeleteDocumentsByQuery(ctx, "idx", params, resource.SchemaDefinition).
+			DeleteDocumentsByQuery(ctx, "idx", params, SchemaForQuery(resource.SchemaDefinition)).
 			DoAndReturn(func(_ context.Context, _ string, p *interfaces.ResourceDataQueryParams, schema []*interfaces.Property) error {
 				gotParams = p
 				gotSchema = schema
@@ -236,9 +239,22 @@ func TestLocalIndexManagerDeleteDocumentsByQueryBuildsActualFilter(t *testing.T)
 			})
 
 		require.NoError(t, manager.DeleteDocumentsByQuery(ctx, "idx", resource, params))
-		require.NotNil(t, params.ActualFilterCond)
-		assert.Equal(t, "==", params.ActualFilterCond.GetOperation())
+		assert.Nil(t, params.ActualFilterCond)
 		assert.Same(t, params, gotParams)
-		assert.Equal(t, resource.SchemaDefinition, gotSchema)
+		assert.Equal(t, SchemaForQuery(resource.SchemaDefinition), gotSchema)
 	})
+}
+
+func TestSchemaForQueryUsesManagedFieldNames(t *testing.T) {
+	schema := []*interfaces.Property{{
+		Name:         "body",
+		OriginalName: "source_body",
+		Type:         interfaces.DataType_Text,
+	}}
+
+	got := SchemaForQuery(schema)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, "body", got[0].OriginalName)
+	assert.Equal(t, "source_body", schema[0].OriginalName)
 }

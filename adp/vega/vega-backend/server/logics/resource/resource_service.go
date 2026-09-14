@@ -31,7 +31,6 @@ import (
 	"vega-backend/interfaces"
 	"vega-backend/logics"
 	"vega-backend/logics/catalog"
-	dataset "vega-backend/logics/dataset"
 	"vega-backend/logics/local_index"
 	model_factory "vega-backend/logics/model_factory"
 	"vega-backend/logics/permission"
@@ -60,13 +59,13 @@ type resourceService struct {
 }
 
 // NewResourceService creates a new ResourceService.
-func NewResourceService(appSetting *common.AppSetting) interfaces.ResourceService {
+func NewResourceService(appSetting *common.AppSetting, datasetService interfaces.DatasetService) interfaces.ResourceService {
 	rServiceOnce.Do(func() {
 		rService = &resourceService{
 			appSetting: appSetting,
 			db:         logics.DB,
 			cs:         catalog.NewCatalogService(appSetting),
-			ds:         dataset.NewDatasetService(appSetting),
+			ds:         datasetService,
 			ps:         permission.NewPermissionService(appSetting),
 			ra:         logics.RA,
 			ums:        user_mgmt.NewUserMgmtService(appSetting),
@@ -498,9 +497,22 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 			req.SourceIdentifier = fmt.Sprintf("%s.%s", req.CatalogID, id)
 		}
 	}
+	if (req.Category == interfaces.ResourceCategoryTable || req.Category == interfaces.ResourceCategoryDataset) && req.SchemaDefinition != nil {
+		AddDefaultStringAndTextFeatures(req.SchemaDefinition, req.IndexConfig)
+	}
 
 	if err := validateSchemaDefinition(ctx, req.SchemaDefinition); err != nil {
 		return nil, err
+	}
+	if req.Category == interfaces.ResourceCategoryTable || req.Category == interfaces.ResourceCategoryDataset {
+		if err := validateKeywordConfig(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
+			return nil, err
+		}
+	}
+	if req.Category == interfaces.ResourceCategoryTable {
+		if err := validateLocalIndexVectorOutputs(ctx, req.SchemaDefinition); err != nil {
+			return nil, err
+		}
 	}
 	if req.Category == interfaces.ResourceCategoryDataset {
 		if err := validateDatasetVectorOutputs(ctx, req.SchemaDefinition); err != nil {
@@ -615,6 +627,7 @@ func (rs *resourceService) GetByID(ctx context.Context, id string) (*interfaces.
 		span.SetStatus(codes.Error, "Resource not found")
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
+	populateResourceColumnCount(resource)
 
 	// Filter objects with viewing permissions based on permissions. The total length of the filtered array is the total number, and there is no need to request the total number again.
 	// Resources in the internal directory are verified by the internal_resource type
@@ -655,7 +668,6 @@ func (rs *resourceService) GetByID(ctx context.Context, id string) (*interfaces.
 		span.RecordError(err)
 		logger.Warnf("Failed to populate resource account names: %v", err)
 	}
-
 	span.SetStatus(codes.Ok, "")
 	return resource, nil
 }
@@ -699,7 +711,12 @@ func (rs *resourceService) InternalGetByID(ctx context.Context, tx *sql.Tx, id s
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.InternalGetByID")
 	defer span.End()
 
-	return rs.ra.GetByID(ctx, tx, id)
+	resource, err := rs.ra.GetByID(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	populateResourceColumnCount(resource)
+	return resource, nil
 }
 
 // InternalGetByIDs is used by the server to batch read the basic information of resources internally without performing permission filtering or loading extended fields.
@@ -716,6 +733,7 @@ func (rs *resourceService) InternalGetByIDs(ctx context.Context, ids []string) (
 		span.SetStatus(codes.Error, "Get resources failed")
 		return nil, err
 	}
+	populateResourceColumnCounts(resources)
 	span.SetStatus(codes.Ok, "")
 	return resources, nil
 }
@@ -730,14 +748,20 @@ func (rs *resourceService) InternalGetByCatalogID(ctx context.Context, catalogID
 		span.SetStatus(codes.Error, "Get resources failed")
 		return nil, err
 	}
+	populateResourceColumnCounts(resources)
 	span.SetStatus(codes.Ok, "")
 	return resources, nil
 }
 
 // GetByIDs retrieves Resources by IDs.
-func (rs *resourceService) GetByIDs(ctx context.Context, ids []string) ([]*interfaces.Resource, error) {
+func (rs *resourceService) GetByIDs(ctx context.Context, ids []string, includeRowCount bool) ([]*interfaces.Resource, error) {
 	if interfaces.IsTrustedProxyRead(ctx) {
-		return rs.InternalGetByIDs(ctx, ids)
+		resources, err := rs.InternalGetByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		rs.populateResourceRowCounts(ctx, resources, includeRowCount)
+		return resources, nil
 	}
 
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Get resources by IDs")
@@ -754,6 +778,7 @@ func (rs *resourceService) GetByIDs(ctx context.Context, ids []string) ([]*inter
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
+	populateResourceColumnCounts(resources)
 
 	// Filter objects with viewing permissions based on permissions. The total length of the filtered array is the total number, and there is no need to request the total number again.
 	// Resources in the internal directory are verified by the internal_resource type
@@ -791,9 +816,74 @@ func (rs *resourceService) GetByIDs(ctx context.Context, ids []string) ([]*inter
 		span.RecordError(err)
 		logger.Warnf("Failed to populate resource account names: %v", err)
 	}
+	rs.populateResourceRowCounts(ctx, resources, includeRowCount)
 
 	span.SetStatus(codes.Ok, "")
 	return resources, nil
+}
+
+func (rs *resourceService) populateResourceRowCounts(ctx context.Context, resources []*interfaces.Resource, includeRowCount bool) {
+	if !includeRowCount {
+		for _, resource := range resources {
+			resource.RowCount = nil
+		}
+		return
+	}
+	for _, resource := range resources {
+		if resource.Category == interfaces.ResourceCategoryDataset {
+			count, err := rs.ds.CountDocuments(ctx, resource)
+			if err != nil {
+				logger.Warnf("Failed to populate dataset row count for resource %s: %v", resource.ID, err)
+				resource.RowCount = nil
+				continue
+			}
+			resource.RowCount = &count
+			continue
+		}
+		count, ok := sourceMetadataRowCount(resource.SourceMetadata)
+		if !ok {
+			resource.RowCount = nil
+			continue
+		}
+		resource.RowCount = &count
+	}
+}
+
+func populateResourceColumnCounts(resources []*interfaces.Resource) {
+	for _, resource := range resources {
+		populateResourceColumnCount(resource)
+	}
+}
+
+func populateResourceColumnCount(resource *interfaces.Resource) {
+	if resource == nil {
+		return
+	}
+	if resource.SchemaDefinition == nil {
+		resource.ColumnCount = nil
+		return
+	}
+	count := len(resource.SchemaDefinition)
+	resource.ColumnCount = &count
+}
+
+func sourceMetadataRowCount(sourceMetadata map[string]any) (int64, bool) {
+	if sourceMetadata == nil {
+		return 0, false
+	}
+	properties, ok := sourceMetadata["properties"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	value, ok := properties["row_count"]
+	if !ok {
+		return 0, false
+	}
+	count, ok := common.NumberAsInt64(value)
+	if !ok || count < 0 {
+		return 0, false
+	}
+	return count, true
 }
 
 // GetByCatalogID retrieves all Resources under a Catalog.
@@ -807,6 +897,7 @@ func (rs *resourceService) GetByCatalogID(ctx context.Context, catalogID string)
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
+	populateResourceColumnCounts(resources)
 
 	span.SetStatus(codes.Ok, "")
 	return resources, nil
@@ -827,6 +918,7 @@ func (rs *resourceService) GetByName(ctx context.Context, catalogID string, name
 		span.SetStatus(codes.Error, "Resource not found")
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
+	populateResourceColumnCount(resource)
 
 	span.SetStatus(codes.Ok, "")
 	return resource, nil
@@ -1005,6 +1097,16 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 		return err
 	}
 
+	// 重新保存 table/dataset 是升级 string/text 默认特征契约的边界。
+	// 读取和构建历史 Schema 时不补齐，以便构建请求明确提示用户重新保存配置。
+	if (resource.Category == interfaces.ResourceCategoryTable || resource.Category == interfaces.ResourceCategoryDataset) && req.SchemaDefinition != nil {
+		indexConfig := req.IndexConfig
+		if indexConfig == nil {
+			indexConfig = resource.IndexConfig
+		}
+		AddDefaultStringAndTextFeatures(req.SchemaDefinition, indexConfig)
+	}
+
 	buildRelevantChanged, err := rs.validateResourceUpdateScope(ctx, resource, req)
 	if err != nil {
 		span.SetStatus(codes.Error, "Invalid resource update scope")
@@ -1041,7 +1143,7 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 	previousFingerprint := ""
 	keyFieldsChanged := req.IndexConfig != nil && indexConfigKeyFieldsChanged(resource.IndexConfig, req.IndexConfig)
 	if buildRelevantChanged {
-		previousFingerprint, err = ResourceIndexConfigFingerprint(resource)
+		previousFingerprint, err = resourceLocalIndexMappingFingerprint(resource)
 		if err != nil {
 			span.SetStatus(codes.Error, "Fingerprint current resource index config failed")
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
@@ -1076,6 +1178,16 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 	if err := validateSchemaDefinition(ctx, resource.SchemaDefinition); err != nil {
 		return err
 	}
+	if resource.Category == interfaces.ResourceCategoryTable || resource.Category == interfaces.ResourceCategoryDataset {
+		if err := validateKeywordConfig(ctx, resource.SchemaDefinition, resource.IndexConfig); err != nil {
+			return err
+		}
+	}
+	if resource.Category == interfaces.ResourceCategoryTable {
+		if err := validateLocalIndexVectorOutputs(ctx, resource.SchemaDefinition); err != nil {
+			return err
+		}
+	}
 	if resource.Category == interfaces.ResourceCategoryDataset {
 		if err := validateDatasetVectorOutputs(ctx, resource.SchemaDefinition); err != nil {
 			return err
@@ -1089,7 +1201,7 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 	}
 	currentFingerprint := ""
 	if buildRelevantChanged {
-		currentFingerprint, err = ResourceIndexConfigFingerprint(resource)
+		currentFingerprint, err = resourceLocalIndexMappingFingerprint(resource)
 		if err != nil {
 			span.SetStatus(codes.Error, "Fingerprint updated resource index config failed")
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
@@ -1151,18 +1263,9 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 			return err
 		}
 	}
-	if keyFieldsChanged {
-		if resource.SyncMark != "" {
-			updated, err := rs.ra.UpdateLocalIndexState(ctx, tx, resource.ID,
-				resource.LocalIndexStatus, resource.LocalIndexName, "")
-			if err != nil || !updated {
-				return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_UpdateFailed).
-					WithErrorDetails("failed to clear resource incremental checkpoint")
-			}
-		}
-		resource.SyncMark = ""
-	} else if buildRelevantChanged && previousFingerprint != currentFingerprint &&
-		resource.LocalIndexStatus == interfaces.ResourceLocalIndexStatusAvailable {
+	indexContractChanged := buildRelevantChanged && previousFingerprint != currentFingerprint &&
+		resource.LocalIndexStatus == interfaces.ResourceLocalIndexStatusAvailable
+	if indexContractChanged {
 		updated, err := rs.ra.UpdateLocalIndexState(ctx, tx, resource.ID,
 			interfaces.ResourceLocalIndexStatusStale, resource.LocalIndexName, "")
 		if err != nil || !updated {
@@ -1174,6 +1277,16 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 				WithErrorDetails("failed to mark resource local index stale")
 		}
 		resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusStale
+		resource.SyncMark = ""
+	} else if keyFieldsChanged {
+		if resource.SyncMark != "" {
+			updated, err := rs.ra.UpdateLocalIndexState(ctx, tx, resource.ID,
+				resource.LocalIndexStatus, resource.LocalIndexName, "")
+			if err != nil || !updated {
+				return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+					WithErrorDetails("failed to clear resource incremental checkpoint")
+			}
+		}
 		resource.SyncMark = ""
 	}
 	if err := tx.Commit(); err != nil {
@@ -1217,6 +1330,17 @@ func indexConfigKeyFieldsChanged(current, requested *interfaces.ResourceIndexCon
 	}
 	return !slices.Equal(current.PrimaryKeyFields, requested.PrimaryKeyFields) ||
 		!slices.Equal(current.IncrementalFields, requested.IncrementalFields)
+}
+
+func resourceLocalIndexMappingFingerprint(resource *interfaces.Resource) (string, error) {
+	resourceCopy := *resource
+	if resource.IndexConfig != nil {
+		indexConfigCopy := *resource.IndexConfig
+		indexConfigCopy.PrimaryKeyFields = nil
+		indexConfigCopy.IncrementalFields = nil
+		resourceCopy.IndexConfig = &indexConfigCopy
+	}
+	return ResourceIndexConfigFingerprint(&resourceCopy)
 }
 
 // SetEnabled changes only a Resource's enabled state.
@@ -1539,6 +1663,12 @@ func (rs *resourceService) InternalCreate(ctx context.Context, tx *sql.Tx, req *
 			return nil, err
 		}
 	}
+	if (req.Category == interfaces.ResourceCategoryTable || req.Category == interfaces.ResourceCategoryDataset) && req.SchemaDefinition != nil {
+		AddDefaultStringAndTextFeatures(req.SchemaDefinition, req.IndexConfig)
+		if err := validateKeywordConfig(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
+			return nil, err
+		}
+	}
 
 	accountInfo, _ := ctx.Value(interfaces.ACCOUNT_INFO_KEY).(interfaces.AccountInfo)
 	resource := &interfaces.Resource{
@@ -1673,11 +1803,15 @@ func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema
 			if feature.FeatureType != interfaces.PropertyFeatureType_Vector {
 				continue
 			}
+			if feature.RefProperty != "" && feature.RefProperty != prop.Name {
+				if len(feature.Config) > 0 {
+					return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+						WithErrorDetails(fmt.Sprintf("vector feature on field %q that references %q must not define config", prop.Name, feature.RefProperty))
+				}
+				continue
+			}
 
 			fieldName := prop.Name
-			if feature.RefProperty != "" {
-				fieldName = feature.RefProperty
-			}
 
 			modelID := ""
 			if feature.Config != nil {
@@ -1709,6 +1843,10 @@ func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema
 			}
 			feature.Config["dimension"] = model.EmbeddingDim
 		}
+	}
+	if err := ValidateVectorFeatureReferences(schema); err != nil {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(err.Error())
 	}
 	return nil
 }
@@ -1817,15 +1955,80 @@ func validateSchemaDefinition(ctx context.Context, schema []*interfaces.Property
 		if property == nil {
 			return unsupportedResourceUpdateError(ctx, "schema_definition cannot contain null fields")
 		}
-		seen := make(map[string]struct{}, len(property.Features))
+		seenTypes := make(map[string]struct{}, len(property.Features))
+		seenNames := make(map[string]struct{}, len(property.Features))
 		for _, feature := range property.Features {
+			if strings.HasPrefix(feature.FeatureName, property.Name+".") {
+				return unsupportedResourceUpdateError(ctx, fmt.Sprintf(
+					"feature name %q must be relative to property %q", feature.FeatureName, property.Name))
+			}
+			if feature.FeatureName != "" {
+				if _, exists := seenNames[feature.FeatureName]; exists {
+					return unsupportedResourceUpdateError(ctx, fmt.Sprintf("property %q has more than one feature named %q", property.Name, feature.FeatureName))
+				}
+				seenNames[feature.FeatureName] = struct{}{}
+			}
 			if feature.FeatureType == "" {
 				continue
 			}
-			if _, exists := seen[feature.FeatureType]; exists {
+			if _, exists := seenTypes[feature.FeatureType]; exists {
 				return unsupportedResourceUpdateError(ctx, fmt.Sprintf("property %q has more than one %q feature", property.Name, feature.FeatureType))
 			}
-			seen[feature.FeatureType] = struct{}{}
+			seenTypes[feature.FeatureType] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func validateKeywordConfig(ctx context.Context, schema []*interfaces.Property, indexConfig *interfaces.ResourceIndexConfig) error {
+	if indexConfig != nil && indexConfig.DefaultKeywordIgnoreAbove != nil {
+		value := *indexConfig.DefaultKeywordIgnoreAbove
+		if value < 1 || value > interfaces.MaxKeywordIgnoreAbove {
+			return unsupportedResourceUpdateError(ctx, fmt.Sprintf(
+				"index_config.default_keyword_ignore_above must be an integer between 1 and %d",
+				interfaces.MaxKeywordIgnoreAbove))
+		}
+	}
+	for _, property := range schema {
+		for _, feature := range property.Features {
+			if feature.FeatureType != interfaces.PropertyFeatureType_Keyword {
+				continue
+			}
+			value, exists := feature.Config["ignore_above"]
+			limit, valid := positiveIntegerConfigValue(value)
+			if !exists || !valid || limit > interfaces.MaxKeywordIgnoreAbove {
+				return unsupportedResourceUpdateError(ctx, fmt.Sprintf(
+					"keyword feature on property %q must define config.ignore_above as an integer between 1 and %d",
+					property.Name, interfaces.MaxKeywordIgnoreAbove))
+			}
+		}
+	}
+	return nil
+}
+
+// validateLocalIndexVectorOutputs reserves generated *_vector field names for
+// string/text vector features that do not reuse an existing vector field.
+func validateLocalIndexVectorOutputs(ctx context.Context, schema []*interfaces.Property) error {
+	logicalFields := make(map[string]struct{}, len(schema))
+	for _, property := range schema {
+		if property != nil {
+			logicalFields[property.Name] = struct{}{}
+		}
+	}
+	for _, property := range schema {
+		if property == nil || (property.Type != interfaces.DataType_String && property.Type != interfaces.DataType_Text) {
+			continue
+		}
+		for _, feature := range property.Features {
+			if feature.FeatureType != interfaces.PropertyFeatureType_Vector || feature.RefProperty != "" {
+				continue
+			}
+			generatedField := local_index.VectorFieldName(property.Name)
+			if _, exists := logicalFields[generatedField]; exists {
+				return unsupportedResourceUpdateError(ctx, fmt.Sprintf(
+					"generated vector field %q conflicts with a logical property %q; set ref_property to reuse an existing vector field",
+					generatedField, generatedField))
+			}
 		}
 	}
 	return nil
@@ -1835,13 +2038,9 @@ func validateSchemaDefinition(ctx context.Context, schema []*interfaces.Property
 // string/text vector features. Dataset does not support ref_property, so a
 // feature always derives from the property it belongs to.
 func validateDatasetVectorOutputs(ctx context.Context, schema []*interfaces.Property) error {
-	logicalFields := make(map[string]struct{}, len(schema))
-	for _, property := range schema {
-		if property != nil {
-			logicalFields[property.Name] = struct{}{}
-		}
+	if err := validateLocalIndexVectorOutputs(ctx, schema); err != nil {
+		return err
 	}
-	generatedFields := make(map[string]string)
 	for _, property := range schema {
 		if property == nil {
 			continue
@@ -1853,20 +2052,6 @@ func validateDatasetVectorOutputs(ctx context.Context, schema []*interfaces.Prop
 			if feature.RefProperty != "" {
 				return unsupportedResourceUpdateError(ctx, "dataset does not support ref_property")
 			}
-			if property.Type != interfaces.DataType_String && property.Type != interfaces.DataType_Text {
-				continue
-			}
-			if feature.FeatureType != interfaces.PropertyFeatureType_Vector {
-				continue
-			}
-			outputField := interfaces.LocalIndexVectorFieldName(property.Name)
-			if _, exists := logicalFields[outputField]; exists {
-				return unsupportedResourceUpdateError(ctx, fmt.Sprintf("dataset vector output field %q conflicts with a logical property", outputField))
-			}
-			if source, exists := generatedFields[outputField]; exists && source != property.Name {
-				return unsupportedResourceUpdateError(ctx, fmt.Sprintf("dataset vector output field %q is generated more than once", outputField))
-			}
-			generatedFields[outputField] = property.Name
 		}
 	}
 	return nil
@@ -1930,15 +2115,39 @@ func validateMutableSchemaUpdate(ctx context.Context, current []*interfaces.Prop
 	return schemaChanged, nil
 }
 
-// mutableFeaturesEqual treats a missing vector dimension in the request as an
-// omitted server-maintained value. A supplied dimension remains part of the
-// comparison, so an explicit mismatch is a schema change.
+// mutableFeaturesEqual compares the index-relevant semantics of features for
+// every Resource category that supports mutable feature configuration. Display
+// metadata, persisted service flags, and order do not change the index contract.
+// A missing vector dimension is treated as an omitted server-maintained value;
+// an explicitly supplied dimension remains part of the comparison.
 func mutableFeaturesEqual(current, requested []interfaces.PropertyFeature) bool {
 	if len(current) != len(requested) {
 		return false
 	}
 	currentCopy := append([]interfaces.PropertyFeature(nil), current...)
 	requestedCopy := append([]interfaces.PropertyFeature(nil), requested...)
+	normalize := func(features []interfaces.PropertyFeature) {
+		for i := range features {
+			features[i].DisplayName = ""
+			features[i].Description = ""
+			features[i].IsDefault = false
+			features[i].IsNative = false
+			if len(features[i].Config) == 0 {
+				features[i].Config = nil
+			}
+		}
+		slices.SortFunc(features, func(left, right interfaces.PropertyFeature) int {
+			if result := strings.Compare(left.FeatureType, right.FeatureType); result != 0 {
+				return result
+			}
+			if result := strings.Compare(left.FeatureName, right.FeatureName); result != 0 {
+				return result
+			}
+			return strings.Compare(left.RefProperty, right.RefProperty)
+		})
+	}
+	normalize(currentCopy)
+	normalize(requestedCopy)
 	for i := range currentCopy {
 		if currentCopy[i].FeatureType != interfaces.PropertyFeatureType_Vector ||
 			requestedCopy[i].FeatureType != interfaces.PropertyFeatureType_Vector {

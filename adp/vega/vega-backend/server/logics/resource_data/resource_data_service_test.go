@@ -9,6 +9,7 @@ package resource_data
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -249,6 +250,34 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		assert.Equal(t, interfaces.ResourceValue{Mode: interfaces.ResourceValueModeUnavailable}, rows[0]["native_value"])
 	})
 
+	t.Run("query table with local index answers 400 for a condition the index cannot build", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockLIM := mock_interfaces.NewMockLocalIndexManager(ctrl)
+		rds := &resourceDataService{cs: mockCS, lim: mockLIM}
+		resource := &interfaces.Resource{
+			ID: "resource-1", Enabled: true, CatalogID: "catalog-1",
+			Category: interfaces.ResourceCategoryTable, LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+			LocalIndexName:   "vega-build-resource-1-task-1",
+			SchemaDefinition: []*interfaces.Property{{Name: "title", Type: interfaces.DataType_Text}},
+		}
+		params := &interfaces.ResourceDataQueryParams{}
+		cause := fmt.Errorf("failed to build filter query: %w",
+			filter_condition.NewConditionBuildError("text field title has no keyword feature; re-save the resource configuration and rebuild the local index, or use match"))
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockLIM.EXPECT().ListDocuments(gomock.Any(), resource.LocalIndexName, resource, params).
+			Return(nil, int64(0), cause)
+
+		_, _, err := rds.query(context.Background(), resource, params)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "re-save the resource configuration")
+	})
+
 	t.Run("force source bypasses local index and returns binary metadata", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
@@ -283,6 +312,32 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		assert.Equal(t, interfaces.ResourceValue{Mode: interfaces.ResourceValueModeMetadata, ByteLength: &length}, rows[0]["blob"])
 	})
 
+	t.Run("query dataset passes the dataset service HTTP error through", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockDS := mock_interfaces.NewMockDatasetService(ctrl)
+		rds := &resourceDataService{cs: mockCS, ds: mockDS}
+		resource := &interfaces.Resource{
+			ID: "dataset-1", Enabled: true, CatalogID: "catalog-1",
+			Category: interfaces.ResourceCategoryDataset, LocalIndexName: "vega-dataset-index-1",
+			SchemaDefinition: []*interfaces.Property{{Name: "body", Type: interfaces.DataType_Text}},
+		}
+		params := &interfaces.ResourceDataQueryParams{}
+		downstream := rest.NewHTTPError(context.Background(), http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+			WithErrorDetails("text field body has no keyword feature; re-save the resource configuration and rebuild the local index, or use match")
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockDS.EXPECT().ListDocuments(gomock.Any(), resource, gomock.Any()).Return(nil, int64(0), downstream)
+
+		_, _, err := rds.query(context.Background(), resource, params)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "re-save the resource configuration")
+	})
+
 	t.Run("query dataset builds actual filter condition and delegates", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
@@ -295,7 +350,7 @@ func TestResourceDataServiceQuery(t *testing.T) {
 			Category:       interfaces.ResourceCategoryDataset,
 			LocalIndexName: "vega-dataset-index-1",
 			SchemaDefinition: []*interfaces.Property{
-				{Name: "name", Type: interfaces.DataType_String},
+				{Name: "name", OriginalName: "source_name", Type: interfaces.DataType_String},
 			},
 		}
 		params := &interfaces.ResourceDataQueryParams{
@@ -317,6 +372,9 @@ func TestResourceDataServiceQuery(t *testing.T) {
 				gotParams *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
 				require.NotNil(t, gotParams.ActualFilterCond)
 				assert.Equal(t, "==", gotParams.ActualFilterCond.GetOperation())
+				equal, ok := gotParams.ActualFilterCond.(*filter_condition.EqualCond)
+				require.True(t, ok)
+				assert.Equal(t, "name", equal.Lfield.OriginalName)
 				return wantRows, int64(1), nil
 			})
 
@@ -365,6 +423,32 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, wantRows, rows)
 		assert.Equal(t, int64(1), total)
+	})
+
+	t.Run("query logic view passes the logic view service HTTP error through", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockLVS := mock_interfaces.NewMockLogicViewService(ctrl)
+		rds := &resourceDataService{cs: mockCS, lvs: mockLVS}
+		resource := &interfaces.Resource{
+			ID: "logic-view-1", Enabled: true, CatalogID: "catalog-1",
+			Category:         interfaces.ResourceCategoryLogicView,
+			SchemaDefinition: []*interfaces.Property{{Name: "body", Type: interfaces.DataType_Text}},
+		}
+		params := &interfaces.ResourceDataQueryParams{}
+		downstream := rest.NewHTTPError(context.Background(), http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+			WithErrorDetails("text field body has no keyword feature; re-save the resource configuration")
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockLVS.EXPECT().QueryWithPaging(gomock.Any(), resource, gomock.Any()).Return(nil, downstream)
+
+		_, _, err := rds.query(context.Background(), resource, params)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "re-save the resource configuration")
 	})
 }
 

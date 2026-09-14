@@ -196,6 +196,70 @@ func TestBuildLocalIndexSchemaBackfillsLegacyVectorDimensionFromTaskSnapshot(t *
 	assert.Nil(t, resource.SchemaDefinition[0].Features[0].Config)
 }
 
+func TestBuildLocalIndexSchemaKeepsReferencingVectorFeatureConfigEmpty(t *testing.T) {
+	resource := &interfaces.Resource{
+		Category: interfaces.ResourceCategoryTable,
+		SchemaDefinition: []*interfaces.Property{
+			{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					RefProperty: "embedding",
+				}},
+			},
+			{
+				Name: "embedding",
+				Type: interfaces.DataType_Vector,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					Config:      map[string]any{"dimension": 3},
+				}},
+			},
+		},
+	}
+	task := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{Features: map[string]interfaces.BuildTaskFieldIndexFeature{
+		"embedding": {Vector: &interfaces.SmallModel{ModelID: "embedding-1", EmbeddingDim: 3}},
+	}}}
+
+	schema, err := buildLocalIndexSchema(task, resource)
+
+	require.NoError(t, err)
+	assert.Nil(t, schema[0].Features[0].Config)
+	assert.Equal(t, 3, schema[1].Features[0].Config["dimension"])
+}
+
+func TestBuildLocalIndexSchemaRejectsReferencedVectorWithoutPersistedDimension(t *testing.T) {
+	resource := &interfaces.Resource{
+		Category: interfaces.ResourceCategoryTable,
+		SchemaDefinition: []*interfaces.Property{
+			{
+				Name: "content",
+				Type: interfaces.DataType_Text,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+					RefProperty: "embedding",
+				}},
+			},
+			{
+				Name: "embedding",
+				Type: interfaces.DataType_Vector,
+				Features: []interfaces.PropertyFeature{{
+					FeatureType: interfaces.PropertyFeatureType_Vector,
+				}},
+			},
+		},
+	}
+	task := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{Features: map[string]interfaces.BuildTaskFieldIndexFeature{
+		"embedding": {Vector: &interfaces.SmallModel{ModelID: "embedding-1", EmbeddingDim: 3}},
+	}}}
+
+	_, err := buildLocalIndexSchema(task, resource)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `referenced vector field "embedding" must define its own positive integer dimension`)
+}
+
 func TestBuildLocalIndexSchemaExcludesBinaryAndOtherFields(t *testing.T) {
 	resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{
 		{Name: "id", Type: interfaces.DataType_Integer},

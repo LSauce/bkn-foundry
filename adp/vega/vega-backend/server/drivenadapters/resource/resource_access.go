@@ -85,8 +85,6 @@ var resourceSummaryColumns = []string{
 	"f_last_discover_status",
 	"f_schema",
 	"f_source_identifier",
-	"f_source_metadata",
-	"f_schema_definition",
 	"f_local_status",
 	"f_local_index_name",
 	"f_sync_mark",
@@ -141,7 +139,7 @@ func scanResource(scanner resourceRowScanner) (*interfaces.Resource, error) {
 
 	resource.Tags = libCommon.TagString2TagSlice(tagsStr)
 	if sourceMetadata.Valid && sourceMetadata.String != "" {
-		_ = sonic.Unmarshal([]byte(sourceMetadata.String), &resource.SourceMetadata)
+		_ = common.UnmarshalPreciseJSON([]byte(sourceMetadata.String), &resource.SourceMetadata)
 	}
 	if schemaDefinition.Valid && schemaDefinition.String != "" {
 		_ = sonic.Unmarshal([]byte(schemaDefinition.String), &resource.SchemaDefinition)
@@ -158,7 +156,6 @@ func scanResource(scanner resourceRowScanner) (*interfaces.Resource, error) {
 func scanResourceSummary(scanner resourceRowScanner) (*interfaces.ResourceSummary, error) {
 	summary := &interfaces.ResourceSummary{}
 	var tagsStr string
-	var sourceMetadata, schemaDefinition sql.NullString
 	if err := scanner.Scan(
 		&summary.ID,
 		&summary.CatalogID,
@@ -172,8 +169,6 @@ func scanResourceSummary(scanner resourceRowScanner) (*interfaces.ResourceSummar
 		&summary.LastDiscoverStatus,
 		&summary.Schema,
 		&summary.SourceIdentifier,
-		&sourceMetadata,
-		&schemaDefinition,
 		&summary.LocalIndexStatus,
 		&summary.LocalIndexName,
 		&summary.SyncMark,
@@ -188,20 +183,6 @@ func scanResourceSummary(scanner resourceRowScanner) (*interfaces.ResourceSummar
 		return nil, err
 	}
 	summary.Tags = libCommon.TagString2TagSlice(tagsStr)
-	if schemaDefinition.Valid && schemaDefinition.String != "" {
-		if node, err := sonic.GetFromString(schemaDefinition.String); err == nil && node.Load() == nil {
-			if n, err := node.Len(); err == nil {
-				summary.ColumnCount = &n
-			}
-		}
-	}
-	if sourceMetadata.Valid && sourceMetadata.String != "" {
-		if node, err := sonic.GetFromString(sourceMetadata.String, "properties", "row_count"); err == nil {
-			if v, err := node.Int64(); err == nil {
-				summary.RowCount = &v
-			}
-		}
-	}
 	return summary, nil
 }
 
