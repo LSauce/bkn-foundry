@@ -1575,14 +1575,25 @@ func (kns *knowledgeNetworkService) GetRelationTypePaths(ctx context.Context,
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "GetRelationTypePaths")
 	defer span.End()
 
-	// This endpoint returns the complete object/relation topology reachable from
-	// the source object type. A visible child is sufficient for navigation, but
-	// must not grant access to the full knowledge-network graph.
+	// This endpoint returns the object/relation topology reachable from the
+	// source object type. A caller with view_detail on the network searches the
+	// whole model. A visible child must not open the full graph, so any other
+	// caller searches only the part its child grants cover, as if nothing else
+	// were in the network (#1553): path nodes carry object type definitions, so
+	// each needs view_detail on its object type, and relation types follow the
+	// relation type read rule (#1562). A caller without view_detail on the
+	// source object type is refused as before.
+	var scope *relationPathScope
 	if err := kns.ps.CheckPermission(ctx, interfaces.PermissionResource{
 		Type: interfaces.RESOURCE_TYPE_KN,
 		ID:   query.KNID,
 	}, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}); err != nil {
-		return nil, err
+		if !isForbidden(err) {
+			return nil, err
+		}
+		if scope, err = kns.resolveRelationPathScope(ctx, query, err); err != nil {
+			return nil, err
+		}
 	}
 
 	// 1. Get the source object type.
@@ -1654,6 +1665,9 @@ func (kns *knowledgeNetworkService) GetRelationTypePaths(ctx context.Context,
 			if err != nil {
 				otellog.LogError(ctx, "Get neighbor paths failed", err)
 				return nil, err
+			}
+			if scope != nil {
+				neighborPathsMap = scope.keep(neighborPathsMap)
 			}
 
 			// Extend every path at the current depth.
