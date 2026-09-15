@@ -62,7 +62,7 @@ func ensureOperationAdapter(client *bkntrace.LifecycleClient) ensureOperationFun
 			ToolName:          intent.ToolName,
 			Protocol:          "mcp",
 			SourceModule:      "context-loader",
-			Input:             normalizedBusinessInput(intent.Input),
+			Input:             normalizedBusinessInputForTool(intent.MCPToolName, intent.KnowledgeNetworkID, intent.Input),
 			CapabilityProfile: capabilityProfileJSON(intent.ToolName),
 		})
 		if apiErr != nil {
@@ -105,7 +105,7 @@ func completeOperationAdapter(client *bkntrace.LifecycleClient) completeOperatio
 			failure.Result = downstream
 			payload = failure
 		}
-		raw, err := sonic.Marshal(payload)
+		raw, err := terminalPayloadForTool(operation.ToolName, payload, downstream.IsError)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -131,6 +131,27 @@ func completeOperationAdapter(client *bkntrace.LifecycleClient) completeOperatio
 	}
 }
 
+// terminalPayloadForTool keeps function execution data out of the Trace
+// payload. The original terminal value is hashed for correlation, while the
+// stored value carries only status and a non-sensitive error classification.
+func terminalPayloadForTool(toolName string, payload any, failed bool) ([]byte, error) {
+	raw, err := sonic.Marshal(payload)
+	if err != nil || toolName != toolKeyExecuteTool {
+		return raw, err
+	}
+	status := "completed"
+	summary := map[string]any{"status": status, "result_hash": hashBytes(raw)}
+	if failed {
+		status = "failed"
+		summary["status"] = status
+		if failure, ok := payload.(operationFailure); ok {
+			summary["error_code"] = failure.Code
+			summary["stage"] = failure.Stage
+		}
+	}
+	return sonic.Marshal(summary)
+}
+
 func toolResultErrorMessage(result *mcpsdk.CallToolResult) string {
 	if structured, ok := result.StructuredContent.(map[string]any); ok {
 		for _, key := range []string{"message", "error"} {
@@ -148,6 +169,27 @@ func toolResultErrorMessage(result *mcpsdk.CallToolResult) string {
 }
 
 func normalizedBusinessInput(input map[string]any) json.RawMessage {
+	return normalizedBusinessInputForTool("", "", input)
+}
+
+func normalizedBusinessInputForTool(toolName, knowledgeNetworkID string, input map[string]any) json.RawMessage {
+	if toolName == toolKeyExecuteTool {
+		// execute_tool dispatches an arbitrary function. Its nested arguments and
+		// any unrecognized top-level extensions may contain business data or
+		// credentials, so Trace persists only the opaque function identity.
+		normalized := make(map[string]any, 3)
+		if knowledgeNetworkID != "" {
+			normalized["kn_id"] = knowledgeNetworkID
+		}
+		for _, key := range []string{"toolbox_id", "tool_id"} {
+			if value, ok := input[key]; ok {
+				normalized[key] = value
+			}
+		}
+		raw, _ := sonic.ConfigStd.Marshal(normalized)
+		return raw
+	}
+
 	normalized := make(map[string]any, len(input))
 	for key, value := range input {
 		if key != "bkn_context" {

@@ -123,6 +123,36 @@ func TestManagedOperationKeyUsesStableHostInvocationAcrossRequests(t *testing.T)
 	}
 }
 
+func TestSessionGuardKeepsOuterContractForManagedExecuteTool(t *testing.T) {
+	request := validBusinessToolRequest()
+	request.Params.Name = toolKeyExecuteTool
+	request.Params.Arguments.(map[string]any)["toolbox_id"] = "box_warehouse"
+	request.Params.Arguments.(map[string]any)["tool_id"] = "tool_reconcile_inventory"
+	request.Params.Arguments.(map[string]any)["arguments"] = map[string]any{
+		"material_code": "525-000016",
+	}
+
+	var seen operationIntent
+	result, err := guardBusinessToolCall(
+		func(_ context.Context, intent operationIntent) (*operationResult, *lifecycleError, error) {
+			seen = intent
+			return &operationResult{}, nil, nil
+		},
+		func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+			return mcpsdk.NewToolResultText("ok"), nil
+		},
+	)(trustedSessionGuardContext(), request)
+	if err != nil || result.IsError {
+		t.Fatalf("execute_tool rejected: result=%#v err=%v", result, err)
+	}
+	if seen.ToolName != toolKeyExecuteTool {
+		t.Fatalf("operation tool name = %q", seen.ToolName)
+	}
+	if seen.Input["toolbox_id"] != "box_warehouse" || seen.Input["tool_id"] != "tool_reconcile_inventory" {
+		t.Fatalf("operation input lost safe capability identity: %#v", seen.Input)
+	}
+}
+
 func TestSessionGuardCoreRejectionPreventsDownstreamCall(t *testing.T) {
 	downstreamCalls := 0
 	guarded := guardBusinessToolCall(
@@ -344,6 +374,61 @@ func TestSessionGuardPendingReplayReturnsReceiptPendingWithoutDownstream(t *test
 		errorValue["required_action"] != "poll_receipt" ||
 		structured["receipt"].(map[string]any)["receipt_id"] != "receipt-1" {
 		t.Fatalf("unexpected pending replay result: %#v", structured)
+	}
+}
+
+func TestManagedExecuteToolReplayProjectsOnlySafeReadbackReceipt(t *testing.T) {
+	for _, status := range []string{"pending", "completed", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			downstreamCalls := 0
+			guarded := guardBusinessToolCall(
+				func(context.Context, operationIntent) (*operationResult, *lifecycleError, error) {
+					return &operationResult{
+						Created: false, Execute: false,
+						Operation: map[string]any{
+							"operation_id": "op-1", "attempt_status": status,
+							"input": map[string]any{"arguments": map[string]any{"secret": "must-not-leak"}},
+						},
+						Receipt: map[string]any{
+							"receipt_id": "receipt-1", "conversation_id": "conv-1", "interaction_id": "int-1",
+							"operation_id": "op-1", "tool_name": toolKeyExecuteTool, "receipt_status": status,
+							"owner": "owner-must-not-leak", "request_id": "request-must-not-leak",
+						},
+					}, nil, nil
+				},
+				func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+					downstreamCalls++
+					return mcpsdk.NewToolResultText("unexpected"), nil
+				},
+			)
+			request := validBusinessToolRequest()
+			request.Params.Name = toolKeyExecuteTool
+			result, err := guarded(trustedSessionGuardContext(), request)
+			if err != nil || !result.IsError || downstreamCalls != 0 {
+				t.Fatalf("replay=%#v err=%v downstream=%d", result, err, downstreamCalls)
+			}
+			text, ok := mcpsdk.AsTextContent(result.Content[0])
+			if !ok || strings.Contains(text.Text, "must-not-leak") {
+				t.Fatalf("replay error leaked durable payload: %#v", result.Content)
+			}
+			structured, ok := result.StructuredContent.(map[string]any)
+			if !ok {
+				t.Fatalf("execute_tool replay omitted structured readback: %#v", result.StructuredContent)
+			}
+			receipt, ok := structured["bkn_receipt"].(map[string]any)
+			if !ok || receipt["receipt_id"] != "receipt-1" || receipt["operation_id"] != "op-1" {
+				t.Fatalf("unexpected replay readback: %#v", structured)
+			}
+			errorValue, ok := structured["error"].(map[string]any)
+			if !ok || errorValue["code"] == nil {
+				t.Fatalf("replay omitted structured error code: %#v", structured)
+			}
+			for _, field := range []string{"owner", "request_id", "operation"} {
+				if _, found := receipt[field]; found {
+					t.Fatalf("replay receipt leaked %s: %#v", field, receipt)
+				}
+			}
+		})
 	}
 }
 
@@ -645,6 +730,61 @@ func TestSessionGuardAttachesOnlyTheReceiptFieldsACallerReads(t *testing.T) {
 	ref := businessRefs[0].(map[string]any)
 	if ref["ref_type"] != "data_resource" || ref["ref_id"] != "resource:r1" || ref["version"] != "unversioned" {
 		t.Fatalf("business reference reshaped by the projection: %#v", ref)
+	}
+}
+
+func TestSessionGuardKeepsReadbackIdentifiersForManagedExecuteTool(t *testing.T) {
+	durable := bkntrace.Receipt{
+		ReceiptID:          "rcpt_function_1",
+		SchemaVersion:      "3.0.0",
+		Owner:              bkntrace.Owner{ApplicationPrincipalID: "app-1", EffectiveSubjectID: "user-1"},
+		ConversationID:     "conv-1",
+		InteractionID:      "int-1",
+		OperationID:        "op-function-1",
+		Attempt:            1,
+		OperationKey:       "mcp:function-1",
+		ToolName:           "toolbox_function:box_warehouse:tool_reconcile_inventory",
+		ReceiptStatus:      "completed",
+		EvidenceDurability: "durable",
+		RequestID:          "req-1",
+		TraceID:            strings.Repeat("a", 32),
+		RowVersion:         3,
+	}
+	guarded := guardBusinessToolCallWithCompletion(
+		func(context.Context, operationIntent) (*operationResult, *lifecycleError, error) {
+			return &operationResult{
+				Created: true, Execute: true,
+				Operation: map[string]any{"operation_id": "op-function-1", "attempt": float64(1)},
+				Receipt:   map[string]any{"receipt_id": "rcpt_function_1", "receipt_status": "pending"},
+			}, nil, nil
+		},
+		func(_ context.Context, ensured *operationResult, _ *mcpsdk.CallToolResult) (*operationResult, *lifecycleError, error) {
+			return &operationResult{Operation: ensured.Operation, Receipt: durable}, nil, nil
+		},
+		nil,
+		func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+			return mcpsdk.NewToolResultStructured(map[string]any{"answer": "ok"}, `{"answer":"ok"}`), nil
+		},
+	)
+
+	request := validBusinessToolRequest()
+	request.Params.Name = toolKeyExecuteTool
+	request.Params.Arguments.(map[string]any)["toolbox_id"] = "box_warehouse"
+	request.Params.Arguments.(map[string]any)["tool_id"] = "tool_reconcile_inventory"
+	result, err := guarded(context.Background(), request)
+	if err != nil || result.IsError {
+		t.Fatalf("execute_tool failed: result=%#v err=%v", result, err)
+	}
+	receipt := result.StructuredContent.(map[string]any)["bkn_receipt"].(map[string]any)
+	for _, field := range []string{"receipt_id", "conversation_id", "interaction_id", "operation_id", "tool_name", "receipt_status", "evidence_durability"} {
+		if receipt[field] == nil || receipt[field] == "" {
+			t.Fatalf("readback receipt omitted %s: %#v", field, receipt)
+		}
+	}
+	for _, field := range []string{"owner", "request_id", "trace_id", "operation_key", "row_version", "issued_at"} {
+		if _, present := receipt[field]; present {
+			t.Fatalf("readback receipt leaked %s: %#v", field, receipt)
+		}
 	}
 }
 

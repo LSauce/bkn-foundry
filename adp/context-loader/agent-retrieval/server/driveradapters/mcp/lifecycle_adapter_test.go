@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -685,6 +686,87 @@ func TestNormalizedBusinessInputPreservesOnlyRealToolArguments(t *testing.T) {
 	}
 }
 
+func TestNormalizedBusinessInputForManagedExecuteToolExcludesFunctionArguments(t *testing.T) {
+	input := map[string]any{
+		"kn_id":         "kn_supply_chain",
+		"toolbox_id":    "box_warehouse",
+		"tool_id":       "tool_reconcile_inventory",
+		"authorization": "Bearer top-level-secret",
+		"token":         "must-not-be-stored",
+		"arguments": map[string]any{
+			"material_code": "525-000016",
+			"authorization": "must-not-be-stored",
+		},
+		"bkn_context": map[string]any{"conversation_id": "conv-1", "interaction_id": "int-1"},
+	}
+	var got map[string]any
+	if err := json.Unmarshal(normalizedBusinessInputForTool(toolKeyExecuteTool, "kn_supply_chain", input), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"kn_id": "kn_supply_chain", "toolbox_id": "box_warehouse", "tool_id": "tool_reconcile_inventory",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored execute_tool input=%#v, want %v", got, want)
+	}
+}
+
+func TestManagedExecuteToolRetainsRegisteredCapabilityProfile(t *testing.T) {
+	var profile CapabilityProfile
+	if err := json.Unmarshal(capabilityProfileJSON(toolKeyExecuteTool), &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.CanonicalToolName != toolKeyExecuteTool || profile.Resolution != capabilityResolutionMatched {
+		t.Fatalf("execute_tool profile lost manifest registration: %#v", profile)
+	}
+	if profile.ChildEvidencePolicy != "managed_children_only" {
+		t.Fatalf("execute_tool child evidence policy = %q", profile.ChildEvidencePolicy)
+	}
+}
+
+func TestManagedExecuteToolTerminalPayloadContainsOnlySafeSummary(t *testing.T) {
+	result := mcpsdk.NewToolResultStructured(map[string]any{
+		"rows": []any{map[string]any{"customer": "sensitive-customer", "token": "must-not-persist"}},
+	}, `{"rows":[{"customer":"sensitive-customer","token":"must-not-persist"}]}`)
+
+	raw, err := terminalPayloadForTool(toolKeyExecuteTool, result, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("sensitive-customer")) || bytes.Contains(raw, []byte("must-not-persist")) {
+		t.Fatalf("execute_tool terminal payload leaked result content: %s", raw)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["status"] != "completed" || !strings.HasPrefix(stringValue(summary["result_hash"]), "sha256:") {
+		t.Fatalf("unexpected terminal summary: %#v", summary)
+	}
+}
+
+func TestManagedExecuteToolFailurePayloadContainsOnlySafeSummary(t *testing.T) {
+	failure := operationFailure{
+		Code: "tool_error", Stage: "tool_execution",
+		Message: "sensitive downstream error: token=must-not-persist",
+		Result:  mcpsdk.NewToolResultError("sensitive downstream error: token=must-not-persist"),
+	}
+	raw, err := terminalPayloadForTool(toolKeyExecuteTool, failure, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("must-not-persist")) || bytes.Contains(raw, []byte("sensitive downstream")) {
+		t.Fatalf("execute_tool failure payload leaked error content: %s", raw)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["status"] != "failed" || summary["error_code"] != "tool_error" || summary["stage"] != "tool_execution" || !strings.HasPrefix(stringValue(summary["result_hash"]), "sha256:") {
+		t.Fatalf("unexpected failure summary: %#v", summary)
+	}
+}
+
 func TestManagedCommunityToolsSubmitRealInputAndTerminalPayload(t *testing.T) {
 	ensureCalls := 0
 	finishCalls := 0
@@ -702,7 +784,16 @@ func TestManagedCommunityToolsSubmitRealInputAndTerminalPayload(t *testing.T) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			inline, _ := body.Input["inline"].(map[string]any)
-			if body.Input["mode"] != "inline" || inline["probe"] != body.ToolName {
+			if body.ToolName == toolKeyExecuteTool {
+				for _, key := range []string{"kn_id", "toolbox_id", "tool_id"} {
+					if inline[key] == nil {
+						t.Errorf("execute_tool input=%#v, missing safe %s", body.Input, key)
+					}
+				}
+				if len(inline) != 3 {
+					t.Errorf("execute_tool input=%#v, want only safe identity", body.Input)
+				}
+			} else if body.Input["mode"] != "inline" || inline["probe"] != body.ToolName {
 				t.Errorf("%s input=%#v, want original tool arguments", body.ToolName, body.Input)
 			}
 			ensureCalls++
@@ -750,6 +841,14 @@ func TestManagedCommunityToolsSubmitRealInputAndTerminalPayload(t *testing.T) {
 		request := businessToolRequest("session-1", "conv-1", "int-1", "call-"+toolName)
 		request.Params.Name = toolName
 		request.Params.Arguments.(map[string]any)["probe"] = toolName
+		if toolName == toolKeyExecuteTool {
+			// CLI and SDK commonly scope the request through X-Kn-ID instead of
+			// repeating kn_id in every execute_tool argument map. The persisted
+			// safe identity must retain that resolved network as well.
+			request.Header.Set("X-Kn-ID", "kn-demo")
+			request.Params.Arguments.(map[string]any)["toolbox_id"] = "box-demo"
+			request.Params.Arguments.(map[string]any)["tool_id"] = "tool-demo"
+		}
 		result, err := handler(ctx, request)
 		if err != nil || result == nil || result.IsError {
 			t.Fatalf("%s lifecycle failed: result=%#v err=%v", toolName, result, err)
@@ -908,6 +1007,94 @@ func TestManagedBusinessToolsPreservePreciseArgumentsAndResults(t *testing.T) {
 		wantErr := json.Unmarshal(wantOutput, &wantOutputValue)
 		if outputs[index].Mode != "inline" || gotErr != nil || wantErr != nil || !reflect.DeepEqual(gotOutputValue, wantOutputValue) {
 			t.Fatalf("%s output=%s, want %s; gotErr=%v wantErr=%v", test.name, outputs[index].Inline, wantOutput, gotErr, wantErr)
+		}
+	}
+}
+
+func TestManagedExecuteToolLifecyclePersistsOnlyTerminalSummaries(t *testing.T) {
+	var captured [][]byte
+	attempt := 0
+	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/interactions/int-1"):
+			_ = json.NewEncoder(w).Encode(bkntrace.Interaction{
+				InteractionID: "int-1", ConversationID: "conv-1", ExecutionStatus: "active", LeaseToken: "lease-1", LeaseEpoch: 1,
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/operations:ensure"):
+			var body struct {
+				ToolName string                   `json:"tool_name"`
+				Input    bkntrace.PayloadEnvelope `json:"input"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode ensure: %v", err)
+			}
+			if body.ToolName != toolKeyExecuteTool || bytes.Contains(body.Input.Inline, []byte("must-not-persist")) {
+				t.Errorf("unsafe execute_tool ensure request: tool=%q input=%s", body.ToolName, body.Input.Inline)
+			}
+			attempt++
+			_ = json.NewEncoder(w).Encode(bkntrace.OperationResult{
+				Created: true, Execute: true,
+				Operation: bkntrace.Operation{OperationID: "op-" + strconv.Itoa(attempt), ConversationID: "conv-1", InteractionID: "int-1", ToolName: toolKeyExecuteTool, Attempt: 1, AttemptStatus: "pending"},
+				Receipt:   bkntrace.Receipt{ReceiptID: "receipt-" + strconv.Itoa(attempt), ReceiptStatus: "pending"},
+			})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/attempts/1:"):
+			var body struct {
+				Output bkntrace.PayloadEnvelope `json:"output"`
+				Error  bkntrace.PayloadEnvelope `json:"error"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode completion: %v", err)
+			}
+			payload := body.Output.Inline
+			if len(payload) == 0 {
+				payload = body.Error.Inline
+			}
+			captured = append(captured, append([]byte(nil), payload...))
+			status := "completed"
+			if strings.HasSuffix(r.URL.Path, ":fail") {
+				status = "failed"
+			}
+			_ = json.NewEncoder(w).Encode(bkntrace.OperationResult{
+				Operation: bkntrace.Operation{OperationID: "op", Attempt: 1, AttemptStatus: status},
+				Receipt:   bkntrace.Receipt{ReceiptID: "receipt", ReceiptStatus: status},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer core.Close()
+
+	call := 0
+	handler := lifecycleToolMiddleware(bkntrace.NewLifecycleClient(core.URL, core.Client()))(
+		func(_ context.Context, _ mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+			call++
+			if call == 1 {
+				return mcpsdk.NewToolResultStructured(map[string]any{"rows": []any{map[string]any{"secret": "must-not-persist"}}}, `{"rows":[{"secret":"must-not-persist"}]}`), nil
+			}
+			return mcpsdk.NewToolResultError("downstream secret: must-not-persist"), nil
+		},
+	)
+	for _, key := range []string{"success", "failure"} {
+		request := businessToolRequest("session-1", "conv-1", "int-1", "execute-"+key)
+		request.Params.Name = toolKeyExecuteTool
+		request.Params.Arguments.(map[string]any)["toolbox_id"] = "box-1"
+		request.Params.Arguments.(map[string]any)["tool_id"] = "tool-1"
+		request.Params.Arguments.(map[string]any)["arguments"] = map[string]any{"secret": "must-not-persist"}
+		result, err := handler(trustedMCPIntegrationContext(context.Background(), 700), request)
+		if err != nil || result == nil {
+			t.Fatalf("%s result=%#v err=%v", key, result, err)
+		}
+	}
+	if len(captured) != 2 {
+		t.Fatalf("captured terminal payloads=%d, want 2", len(captured))
+	}
+	for _, raw := range captured {
+		if bytes.Contains(raw, []byte("must-not-persist")) || bytes.Contains(raw, []byte("downstream secret")) {
+			t.Fatalf("terminal payload leaked function data: %s", raw)
+		}
+		var summary map[string]any
+		if err := json.Unmarshal(raw, &summary); err != nil || summary["result_hash"] == nil {
+			t.Fatalf("terminal payload is not a summary: %s err=%v", raw, err)
 		}
 	}
 }
