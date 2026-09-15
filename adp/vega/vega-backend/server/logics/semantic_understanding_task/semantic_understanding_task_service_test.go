@@ -837,8 +837,8 @@ func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 		taskAccess.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, int64(2), nil)
 		catalogService.EXPECT().AuthorizedCatalogsForTasks(gomock.Any(), gomock.Any()).Return(nil, true, nil, nil).AnyTimes()
 		catalogService.EXPECT().AuthorizedCatalogsForTasks(gomock.Any(), gomock.Any()).Return(nil, true, nil, nil).AnyTimes()
-		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{{ID: "resource-1", Name: "资源一"}}, nil)
-		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-1"}).Return([]*interfaces.Catalog{{ID: "catalog-1", Name: "目录一"}}, nil)
+		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-1"}).Return(map[string]*interfaces.Resource{"resource-1": {ID: "resource-1", Name: "资源一"}}, nil)
+		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-1"}).Return(map[string]*interfaces.Catalog{"catalog-1": {ID: "catalog-1", Name: "目录一"}}, nil)
 
 		got, _, err := service.List(context.Background(), interfaces.SemanticUnderstandingTaskQueryParams{})
 
@@ -850,8 +850,8 @@ func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 	t.Run("get populates reference names", func(t *testing.T) {
 		task := &interfaces.SemanticUnderstandingTask{ID: "task-3", CatalogID: "catalog-2", ResourceID: "resource-2"}
 		taskAccess.EXPECT().GetByID(gomock.Any(), "task-3").Return(task, nil)
-		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-2"}).Return([]*interfaces.Resource{{ID: "resource-2", Name: "资源二"}}, nil)
-		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-2"}).Return([]*interfaces.Catalog{{ID: "catalog-2", Name: "目录二"}}, nil)
+		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-2"}).Return(map[string]*interfaces.Resource{"resource-2": {ID: "resource-2", Name: "资源二"}}, nil)
+		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-2"}).Return(map[string]*interfaces.Catalog{"catalog-2": {ID: "catalog-2", Name: "目录二"}}, nil)
 		userMgmtService.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
 
 		got, err := service.GetByID(context.Background(), "task-3")
@@ -865,7 +865,7 @@ func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 		tasks := []*interfaces.SemanticUnderstandingTaskSummary{{ID: "task-4", CatalogID: "catalog-3", ResourceID: "resource-3"}}
 		taskAccess.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, int64(1), nil)
 		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-3"}).Return(nil, errors.New("resource service down"))
-		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-3"}).Return([]*interfaces.Catalog{{ID: "catalog-3", Name: "目录三"}}, nil)
+		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-3"}).Return(map[string]*interfaces.Catalog{"catalog-3": {ID: "catalog-3", Name: "目录三"}}, nil)
 
 		got, total, err := service.List(context.Background(), interfaces.SemanticUnderstandingTaskQueryParams{})
 
@@ -893,9 +893,9 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 
 		taskAccess.EXPECT().
 			GetByIDs(gomock.Any(), []string{"task-1", "missing", "task-2"}).
-			Return([]*interfaces.SemanticUnderstandingTask{
-				{ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
-				{ID: "task-2", Status: interfaces.SemanticUnderstandingTaskStatusFailed},
+			Return(map[string]*interfaces.SemanticUnderstandingTask{
+				"task-1": {ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
+				"task-2": {ID: "task-2", Status: interfaces.SemanticUnderstandingTaskStatusFailed},
 			}, nil)
 		taskAccess.EXPECT().
 			DeleteByIDs(gomock.Any(), []string{"task-1", "task-2"}).
@@ -921,9 +921,9 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 
 		taskAccess.EXPECT().
 			GetByIDs(gomock.Any(), []string{"task-1", "task-2"}).
-			Return([]*interfaces.SemanticUnderstandingTask{
-				{ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusPending},
-				{ID: "task-2", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
+			Return(map[string]*interfaces.SemanticUnderstandingTask{
+				"task-1": {ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusPending},
+				"task-2": {ID: "task-2", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
 			}, nil)
 
 		err := service.DeleteByIDs(context.Background(), []string{"task-1", "task-2"}, false)
@@ -947,8 +947,8 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 
 		taskAccess.EXPECT().
 			GetByIDs(gomock.Any(), []string{"task-1", "missing"}).
-			Return([]*interfaces.SemanticUnderstandingTask{
-				{ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
+			Return(map[string]*interfaces.SemanticUnderstandingTask{
+				"task-1": {ID: "task-1", Status: interfaces.SemanticUnderstandingTaskStatusCompleted},
 			}, nil)
 
 		err := service.DeleteByIDs(context.Background(), []string{"task-1", "missing"}, false)

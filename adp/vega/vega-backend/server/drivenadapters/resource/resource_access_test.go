@@ -187,16 +187,17 @@ func TestResourceAccessGetByIDs(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta(resourceSelectSQL("f_id IN (?,?)"))).
 			WithArgs("resource-1", "resource-2").
 			WillReturnRows(resourceRows().
-				AddRow(resourceRowValues(sampleResource())...).
-				AddRow(resourceRowValues(second)...))
+				AddRow(resourceRowValues(second)...).
+				AddRow(resourceRowValues(sampleResource())...))
 
 		got, err := access.GetByIDs(context.Background(), []string{"resource-1", "resource-2"})
 
 		require.NoError(t, err)
 		require.Len(t, got, 2)
-		assert.Equal(t, []string{"resource-1", "resource-2"}, []string{got[0].ID, got[1].ID})
-		assert.Nil(t, got[0].ColumnCount)
-		assert.Nil(t, got[1].ColumnCount)
+		assert.Equal(t, "resource-1", got["resource-1"].ID)
+		assert.Equal(t, "resource-2", got["resource-2"].ID)
+		assert.Nil(t, got["resource-1"].ColumnCount)
+		assert.Nil(t, got["resource-2"].ColumnCount)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -240,7 +241,7 @@ func TestResourceAccessGetSummariesByIDs(t *testing.T) {
 
 		mock.ExpectQuery(regexp.QuoteMeta(resourceSummarySelectSQL("f_id IN (?,?)"))).
 			WithArgs("resource-1", "resource-2").
-			WillReturnRows(resourceSummaryRows().AddRow(
+			WillReturnRows(resourceSummaryRows().AddRow(resourceSummaryRowValues(sampleResourceWithID("resource-2"))...).AddRow(
 				"resource-1", "catalog-1", "orders", "pii,core", "desc", interfaces.ResourceCategoryTable, true, interfaces.ResourceStatusActive, "ready", interfaces.DiscoverStatusNew,
 				"db1", "public.orders",
 				interfaces.ResourceLocalIndexStatusAvailable, "vega-build-resource-1-task-1", `{"mode":"batch","cursor":[10,"a"]}`, "",
@@ -250,8 +251,9 @@ func TestResourceAccessGetSummariesByIDs(t *testing.T) {
 		got, err := access.GetSummariesByIDs(context.Background(), []string{"resource-1", "resource-2"})
 
 		require.NoError(t, err)
-		require.Len(t, got, 1)
-		assert.Equal(t, []string{"pii", "core"}, got[0].Tags)
+		require.Len(t, got, 2)
+		assert.Equal(t, "resource-2", got["resource-2"].ID)
+		assert.Equal(t, []string{"pii", "core"}, got["resource-1"].Tags)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 }
@@ -264,15 +266,15 @@ func TestResourceAccessGetPermissionRefsByIDs(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT f_id, f_catalog_id FROM t_resource WHERE f_id IN (?,?)")).
 			WithArgs("resource-1", "resource-2").
 			WillReturnRows(sqlmock.NewRows([]string{"f_id", "f_catalog_id"}).
-				AddRow("resource-1", "catalog-1").
-				AddRow("resource-2", "catalog-2"))
+				AddRow("resource-2", "catalog-2").
+				AddRow("resource-1", "catalog-1"))
 
 		got, err := access.GetPermissionRefsByIDs(context.Background(), []string{"resource-1", "resource-2"})
 
 		require.NoError(t, err)
-		assert.Equal(t, []interfaces.ResourcePermissionRef{
-			{ResourceID: "resource-1", CatalogID: "catalog-1"},
-			{ResourceID: "resource-2", CatalogID: "catalog-2"},
+		assert.Equal(t, map[string]interfaces.ResourcePermissionRef{
+			"resource-1": {ResourceID: "resource-1", CatalogID: "catalog-1"},
+			"resource-2": {ResourceID: "resource-2", CatalogID: "catalog-2"},
 		}, got)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
