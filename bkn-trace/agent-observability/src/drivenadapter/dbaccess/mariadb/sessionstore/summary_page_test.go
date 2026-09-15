@@ -20,12 +20,75 @@ func TestSummaryOwnerWherePreservesLegacySubjectBoundary(t *testing.T) {
 		AccountID: "subject-1", AccountType: "service",
 	}})
 	wantWhere := []string{
-		"r.effective_subject_type=?", "r.effective_subject_id=?",
+		"r.effective_subject_type=CONVERT(? USING ascii) COLLATE ascii_bin",
+		"r.effective_subject_id=CONVERT(? USING ascii) COLLATE ascii_bin",
 	}
 	wantArgs := []any{"service", "subject-1"}
 	if !reflect.DeepEqual(where, wantWhere) || !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("where=%v args=%v", where, args)
 	}
+}
+
+func TestSummaryOwnerWherePinsASCIIIdentityParametersToASCIIBinaryCollation(t *testing.T) {
+	where, _ := summaryOwnerWhere("c", isessionstore.SummaryPageQuery{Scope: evidencevo.QueryScope{
+		AccountID: "super_admin", AccountType: "service",
+	}})
+	for _, expected := range []string{
+		"c.effective_subject_type=CONVERT(? USING ascii) COLLATE ascii_bin",
+		"c.effective_subject_id=CONVERT(? USING ascii) COLLATE ascii_bin",
+	} {
+		if !contains(where, expected) {
+			t.Fatalf("where=%v, missing %q", where, expected)
+		}
+	}
+}
+
+func TestSummaryOwnerWhereFailsClosedForNonASCIIAccountIdentity(t *testing.T) {
+	where, args := summaryOwnerWhere("c", isessionstore.SummaryPageQuery{Scope: evidencevo.QueryScope{
+		AccountID: "业务用户", AccountType: "service",
+	}})
+	if !reflect.DeepEqual(where, []string{"1=0"}) || len(args) != 0 {
+		t.Fatalf("non-ASCII account identity must not produce a lossy ASCII comparison: where=%v args=%v", where, args)
+	}
+}
+
+func TestSummaryOwnerWhereRetainsASCIIApplicationPrincipalWhenSubjectIsNonASCII(t *testing.T) {
+	profile := evidencevo.AccessProfile{
+		AccountActive:          true,
+		EffectiveSubjectID:     "业务用户",
+		ApplicationPrincipalID: "application-1",
+	}
+	where, args := summaryOwnerWhere("c", isessionstore.SummaryPageQuery{Scope: evidencevo.QueryScope{
+		AccessProfile: &profile,
+	}})
+	wantWhere := []string{"(c.application_principal_id=CONVERT(? USING ascii) COLLATE ascii_bin)"}
+	if !reflect.DeepEqual(where, wantWhere) || !reflect.DeepEqual(args, []any{"application-1"}) {
+		t.Fatalf("non-ASCII subject must not disable an ASCII application owner branch: where=%v args=%v", where, args)
+	}
+}
+
+func TestSummaryOwnerWhereRetainsASCIISubjectWhenApplicationPrincipalIsNonASCII(t *testing.T) {
+	profile := evidencevo.AccessProfile{
+		AccountActive:          true,
+		EffectiveSubjectID:     "subject-1",
+		ApplicationPrincipalID: "业务应用",
+	}
+	where, args := summaryOwnerWhere("c", isessionstore.SummaryPageQuery{Scope: evidencevo.QueryScope{
+		AccessProfile: &profile,
+	}})
+	wantWhere := []string{"(c.effective_subject_id=CONVERT(? USING ascii) COLLATE ascii_bin)"}
+	if !reflect.DeepEqual(where, wantWhere) || !reflect.DeepEqual(args, []any{"subject-1"}) {
+		t.Fatalf("non-ASCII application principal must not disable an ASCII subject owner branch: where=%v args=%v", where, args)
+	}
+}
+
+func contains(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestConversationSummaryReceiptExistsExcludesPendingAndUsesReceiptTime(t *testing.T) {
@@ -58,14 +121,14 @@ func TestConversationSummaryExcludedAgentPredicateMatchesAllCanonicalAgentIdenti
 	clause, args := conversationSummaryExcludedAgentPredicate("c", []string{"analysis-agent", "", "analysis-agent", "claim-agent"})
 	for _, expected := range []string{
 		"c.agent_name IS NULL OR c.agent_name NOT IN (?,?)",
-		"c.application_principal_id IS NULL OR c.application_principal_id NOT IN (?,?)",
-		"c.effective_subject_id IS NULL OR c.effective_subject_id NOT IN (?,?)",
+		"c.application_principal_id IS NULL OR c.application_principal_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin,CONVERT(? USING ascii) COLLATE ascii_bin)",
+		"c.effective_subject_id IS NULL OR c.effective_subject_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin,CONVERT(? USING ascii) COLLATE ascii_bin)",
 	} {
 		if !strings.Contains(clause, expected) {
 			t.Fatalf("predicate is missing %q: %s", expected, clause)
 		}
 	}
-	if strings.Count(clause, "NOT IN (?,?)") != 3 {
+	if strings.Count(clause, "NOT IN (?,?)") != 1 {
 		t.Fatalf("clause=%s", clause)
 	}
 	if !reflect.DeepEqual(args, []any{
@@ -77,12 +140,24 @@ func TestConversationSummaryExcludedAgentPredicateMatchesAllCanonicalAgentIdenti
 	}
 }
 
+func TestConversationSummaryExcludedAgentPredicatePinsASCIIIdentityParametersToASCIIBinaryCollation(t *testing.T) {
+	clause, _ := conversationSummaryExcludedAgentPredicate("c", []string{"analysis-agent"})
+	for _, expected := range []string{
+		"c.application_principal_id IS NULL OR c.application_principal_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin)",
+		"c.effective_subject_id IS NULL OR c.effective_subject_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin)",
+	} {
+		if !strings.Contains(clause, expected) {
+			t.Fatalf("clause=%s, missing %q", clause, expected)
+		}
+	}
+}
+
 func TestConversationSummaryExcludedAgentPredicateDoesNotCompareNonASCIIValuesToASCIIColumns(t *testing.T) {
 	clause, args := conversationSummaryExcludedAgentPredicate("c", []string{"业务溯源优化Agent", "business_provenance_optimizer"})
 	for _, expected := range []string{
 		"c.agent_name IS NULL OR c.agent_name NOT IN (?,?)",
-		"c.application_principal_id IS NULL OR c.application_principal_id NOT IN (?)",
-		"c.effective_subject_id IS NULL OR c.effective_subject_id NOT IN (?)",
+		"c.application_principal_id IS NULL OR c.application_principal_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin)",
+		"c.effective_subject_id IS NULL OR c.effective_subject_id NOT IN (CONVERT(? USING ascii) COLLATE ascii_bin)",
 	} {
 		if !strings.Contains(clause, expected) {
 			t.Fatalf("predicate is missing %q: %s", expected, clause)
