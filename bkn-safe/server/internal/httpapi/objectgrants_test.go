@@ -6,6 +6,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -48,6 +49,7 @@ type ogEntry struct {
 		Operation       string `json:"operation"`
 		PolicySource    string `json:"policy_source"`
 		AuthoritySource string `json:"authority_source"`
+		CreatedBy       string `json:"created_by"`
 		Active          bool   `json:"active"`
 		Inherited       bool   `json:"inherited"`
 	} `json:"grants"`
@@ -781,6 +783,181 @@ func TestObjectGrantsOwnerMayShareOwnObject(t *testing.T) {
 	}
 }
 
+func TestObjectGrantsOwnerBatchRevokeIsAllOrNothing(t *testing.T) {
+	r, e, db := ownerGrantFixtureWithDB(t)
+	if w := tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants", map[string]any{
+		"accessor_id": "u-mate",
+		"resource":    map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":  []string{"view_detail", "modify"},
+	}, "u-owner"); w.Code != http.StatusNoContent {
+		t.Fatalf("owner share = %d %s; want 204", w.Code, w.Body.String())
+	}
+	ownerViewID := oneGrantID(t, e, authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine", Operation: "view_detail",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-owner",
+	})
+	ownerModifyID := oneGrantID(t, e, authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine", Operation: "modify",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-owner",
+	})
+	if err := e.GrantProfessionalObjectPermission("u-mate", "knowledge_network", "kn-mine",
+		"task_manage", authz.EffectAllow, authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+	adminID := oneGrantID(t, e, authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine", Operation: "task_manage",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceAdminAuthz,
+	})
+
+	// A foreign source in the request rejects the entire operation. In
+	// particular, the owner-managed record preceding it must remain intact.
+	w := tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants/revoke", map[string]any{
+		"grant_ids": []string{ownerViewID, adminID},
+	}, "u-owner")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("mixed-owner batch revoke = %d %s; want 403", w.Code, w.Body.String())
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); !ok {
+		t.Fatal("rejected batch partially removed the owner source")
+	}
+
+	clearAuditLog(t, db)
+	w = tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants/revoke", map[string]any{
+		"grant_ids": []string{ownerViewID, ownerModifyID},
+	}, "u-owner")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("owner batch revoke = %d %s; want 204", w.Code, w.Body.String())
+	}
+	rows := objectGrantRevokeAuditRows(t, db, w.Header().Get("x-request-id"))
+	if len(rows) != 2 {
+		t.Fatalf("owner batch revoke audit rows = %d, want 2", len(rows))
+	}
+	wantIDs := map[string]bool{ownerViewID: true, ownerModifyID: true}
+	for _, row := range rows {
+		outcome := objectGrantRevokeAuditOutcome(t, row)
+		if !wantIDs[row.TargetID] || outcome["grant_id"] != row.TargetID ||
+			outcome["policy_source"] != "professional_rule" ||
+			outcome["authority_source"] != "owner_delegate" ||
+			outcome["created_by"] != "u-owner" || outcome["via"] != "owner" || outcome["removed"] != true {
+			t.Fatalf("owner batch revoke audit row = %+v outcome=%v", row, outcome)
+		}
+		delete(wantIDs, row.TargetID)
+	}
+	if len(wantIDs) != 0 {
+		t.Fatalf("owner batch revoke missed audit ids: %v", wantIDs)
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); ok {
+		t.Fatal("successful batch retained view_detail")
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "modify"); ok {
+		t.Fatal("successful batch retained modify")
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "task_manage"); !ok {
+		t.Fatal("owner batch removed the administrator source")
+	}
+}
+
+func TestObjectGrantsLargeBatchRevokeKeepsEveryAuditSource(t *testing.T) {
+	r, e, db := ownerGrantFixtureWithDB(t)
+	operations := make([]string, 0, 20)
+	for i := 0; i < cap(operations); i++ {
+		operations = append(operations, fmt.Sprintf("batch_op_%02d", i))
+	}
+	if err := e.SetProfessionalObjectPermissionsBy("u-mate", "knowledge_network", "kn-mine",
+		operations, authz.EffectAllow, authz.AuthoritySourceOwnerDelegate, "u-owner"); err != nil {
+		t.Fatal(err)
+	}
+	records, err := e.PolicyRecords(authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine", Effect: authz.EffectAllow,
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-owner",
+	})
+	if err != nil || len(records) != len(operations) {
+		t.Fatalf("batch source records = %d err=%v, want %d", len(records), err, len(operations))
+	}
+	grantIDs := make([]string, 0, len(records))
+	legacySources := make([]gin.H, 0, len(records))
+	for _, record := range records {
+		grantIDs = append(grantIDs, record.GrantID)
+		source := objectGrantRevokeAuditSource(record, authorityOwner)
+		source["removed"] = true
+		legacySources = append(legacySources, source)
+	}
+	legacyDetail, err := json.Marshal(map[string]any{
+		"grant_ids": grantIDs,
+		"_outcome": map[string]any{
+			"grant_ids": grantIDs, "grant_sources": legacySources, "removed": len(grantIDs),
+		},
+	})
+	if err != nil || len(legacyDetail) <= maxAuditDetail {
+		t.Fatalf("regression fixture detail size = %d err=%v, want over %d", len(legacyDetail), err, maxAuditDetail)
+	}
+
+	clearAuditLog(t, db)
+	w := tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants/revoke",
+		map[string]any{"grant_ids": grantIDs}, "u-owner")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("large owner batch revoke = %d %s; want 204", w.Code, w.Body.String())
+	}
+	rows := objectGrantRevokeAuditRows(t, db, w.Header().Get("x-request-id"))
+	if len(rows) != len(grantIDs) {
+		t.Fatalf("large batch audit rows = %d, want %d", len(rows), len(grantIDs))
+	}
+	wantIDs := make(map[string]bool, len(grantIDs))
+	for _, grantID := range grantIDs {
+		wantIDs[grantID] = true
+	}
+	for _, row := range rows {
+		outcome := objectGrantRevokeAuditOutcome(t, row)
+		if !wantIDs[row.TargetID] || outcome["grant_id"] != row.TargetID ||
+			outcome["policy_source"] != "professional_rule" ||
+			outcome["authority_source"] != "owner_delegate" ||
+			outcome["created_by"] != "u-owner" || outcome["operation"] == "" ||
+			outcome["effect"] != "allow" || outcome["via"] != "owner" || outcome["removed"] != true {
+			t.Fatalf("large batch audit row = %+v outcome=%v", row, outcome)
+		}
+		delete(wantIDs, row.TargetID)
+	}
+	if len(wantIDs) != 0 {
+		t.Fatalf("large batch audit missed ids: %v", wantIDs)
+	}
+	remaining, err := e.PolicyRecords(authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-owner",
+	})
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("large batch remaining records = %d err=%v, want none", len(remaining), err)
+	}
+}
+
+func objectGrantRevokeAuditRows(t *testing.T, db *gorm.DB, requestID string) []model.AuditLog {
+	t.Helper()
+	var rows []model.AuditLog
+	if err := db.Where("request_id = ?", requestID).Order("seq ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func objectGrantRevokeAuditOutcome(t *testing.T, row model.AuditLog) map[string]any {
+	t.Helper()
+	if len(row.Detail) > maxAuditDetail || !json.Valid([]byte(row.Detail)) {
+		t.Fatalf("audit detail is not valid bounded JSON (%d bytes): %s", len(row.Detail), row.Detail)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(row.Detail), &detail); err != nil {
+		t.Fatal(err)
+	}
+	outcome, ok := detail["_outcome"].(map[string]any)
+	if !ok {
+		t.Fatalf("audit detail has no outcome: %s", row.Detail)
+	}
+	return outcome
+}
+
 func TestObjectGrantsUseKnowledgeNetworkAsChildAuthorizationRoot(t *testing.T) {
 	r, e, db := ownerGrantFixtureWithDB(t)
 	if err := db.Create(&model.ResourceType{
@@ -1045,6 +1222,99 @@ func TestObjectGrantsAuthorizeRevocationRemovesSharingAuthority(t *testing.T) {
 	}
 }
 
+func TestObjectGrantsDelegatedGrantSurvivesGrantorRevocation(t *testing.T) {
+	r, e, _ := ownerGrantFixtureWithDB(t)
+	if err := e.GrantProfessionalObjectPermission("u-stranger", "knowledge_network", "kn-mine",
+		"view_detail", authz.EffectAllow, authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.GrantProfessionalObjectPermission("u-stranger", "knowledge_network", "kn-mine",
+		"authorize", authz.EffectAllow, authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.GrantProfessionalObjectPermission("u-stranger", "knowledge_network", "kn-mine",
+		"modify", authz.EffectAllow, authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+
+	// B (u-stranger) creates a durable object grant for C (u-mate).
+	w := tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants", map[string]any{
+		"accessor_id": "u-mate",
+		"resource":    map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":  []string{"view_detail", "modify"},
+	}, "u-stranger")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delegated grant: want 204, got %d (%s)", w.Code, w.Body.String())
+	}
+	// A second delegate's same-operation source is independent. B cannot remove
+	// it merely because both sources grant C access to the same object.
+	w = tokReq(t, r, http.MethodPost, "/api/safe/v1/me/object-grants", map[string]any{
+		"accessor_id": "u-mate",
+		"resource":    map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":  []string{"view_detail"},
+	}, "u-owner")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("second delegated grant: want 204, got %d (%s)", w.Code, w.Body.String())
+	}
+	ownerGrantID := oneGrantID(t, e, authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine", Operation: "view_detail",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-owner",
+	})
+	w = tokReq(t, r, http.MethodDelete, "/api/safe/v1/me/object-grants", map[string]any{
+		"grant_id": ownerGrantID,
+	}, "u-stranger")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("B deleting another delegate source: want 403, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	records, err := e.PolicyRecords(authz.PolicyFilter{
+		AccessorID: "u-mate", Object: "knowledge_network:kn-mine",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+		CreatedBy: "u-stranger",
+	})
+	if err != nil || len(records) != 2 {
+		t.Fatalf("delegated records = %+v, %v; want two records created by B", records, err)
+	}
+
+	// Revoking B's own object grants prevents future delegation only. C's
+	// previously issued, independently persisted grants stay effective.
+	grantorRecords, err := e.PolicyRecords(authz.PolicyFilter{
+		AccessorID: "u-stranger", Object: "knowledge_network:kn-mine",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceAdminAuthz,
+	})
+	if err != nil || len(grantorRecords) != 3 {
+		t.Fatalf("B grant records = %+v, %v; want three records", grantorRecords, err)
+	}
+	for _, record := range grantorRecords {
+		if _, err := e.RevokePolicy(record.GrantID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ok, _ := e.Check("u-stranger", "knowledge_network", "kn-mine", "authorize"); ok {
+		t.Fatal("B retained authorize after revocation")
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); !ok {
+		t.Fatal("C lost its durable delegated view permission")
+	}
+	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "modify"); !ok {
+		t.Fatal("C lost its durable delegated modify permission")
+	}
+
+	entries := listObjectGrants(t, r, "?accessor_id=u-mate")
+	grantorSourceCount := 0
+	if len(entries) == 1 {
+		for _, grant := range entries[0].Grants {
+			if grant.CreatedBy == "u-stranger" {
+				grantorSourceCount++
+			}
+		}
+	}
+	if len(entries) != 1 || len(entries[0].Grants) != 3 || grantorSourceCount != 2 {
+		t.Fatalf("grant listing lost B provenance: %+v", entries)
+	}
+}
+
 // A role holding type-wide authorize may delegate any instance of that type.
 // This existing non-creator path remains restricted by the same two limits.
 func TestObjectGrantsTypeWideAuthorize(t *testing.T) {
@@ -1159,6 +1429,53 @@ func TestObjectGrantsOwnerDirectoryLookups(t *testing.T) {
 	// directory, so an empty search is refused rather than answered with a page.
 	if w := tokReq(t, r, http.MethodGet, base+"/grantable-users?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-owner"); w.Code != http.StatusBadRequest {
 		t.Fatalf("picker without a search term: want 400, got %d", w.Code)
+	}
+}
+
+func TestObjectGrantsOwnerPolicyReadIdentifiesRoleSubjects(t *testing.T) {
+	r, e, db := ownerGrantFixtureWithDB(t)
+	if err := db.Create(&model.Role{ID: "role-readers", Name: "Readers", Source: model.RoleSourceCustom}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := e.GrantRolePermission("role-readers", "knowledge_network", "kn-mine", "view_detail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.GrantObjectPermission(authz.PublicAccessorID, "knowledge_network", "kn-mine", "view_detail"); err != nil {
+		t.Fatal(err)
+	}
+
+	w := tokReq(t, r, http.MethodGet,
+		"/api/safe/v1/me/object-grants?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-owner")
+	if w.Code != http.StatusOK {
+		t.Fatalf("read grants with role: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var grants struct {
+		Entries []struct {
+			AccessorID   string `json:"accessor_id"`
+			AccessorName string `json:"accessor_name"`
+			AccessorType string `json:"accessor_type"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &grants); err != nil {
+		t.Fatal(err)
+	}
+	foundRole, foundPublic := false, false
+	for _, entry := range grants.Entries {
+		if entry.AccessorID == "role-readers" {
+			if entry.AccessorType != "role" || entry.AccessorName != "Readers" {
+				t.Fatalf("role identity = %+v, want type=role name=Readers", entry)
+			}
+			foundRole = true
+		}
+		if entry.AccessorID == authz.PublicAccessorID {
+			if entry.AccessorType != "public" {
+				t.Fatalf("public identity = %+v, want type=public", entry)
+			}
+			foundPublic = true
+		}
+	}
+	if !foundRole || !foundPublic {
+		t.Fatalf("subject rows missing: role=%t public=%t entries=%+v", foundRole, foundPublic, grants.Entries)
 	}
 }
 
