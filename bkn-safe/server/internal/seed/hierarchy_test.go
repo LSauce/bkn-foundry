@@ -108,8 +108,25 @@ func TestSeedDeclaresKnowledgeNetworkHierarchy(t *testing.T) {
 	if err := db.First(&vegaResource, "id = ?", "resource").Error; err != nil {
 		t.Fatalf("load Vega resource type: %v", err)
 	}
-	if vegaResource.ParentTypeID != "" {
-		t.Errorf("Vega resource parent = %q, want no hierarchy", vegaResource.ParentTypeID)
+	if vegaResource.ParentTypeID != "catalog" {
+		t.Errorf("Vega resource parent = %q, want catalog", vegaResource.ParentTypeID)
+	}
+	resourceOps := map[string]string{}
+	var operations []model.Operation
+	if err := db.Where("resource_type_id = ?", "resource").Find(&operations).Error; err != nil {
+		t.Fatalf("load Vega resource operations: %v", err)
+	}
+	for _, operation := range operations {
+		resourceOps[operation.ID] = operation.ParentOperationID
+	}
+	if got := resourceOps["view_detail"]; got != "view_detail" {
+		t.Errorf("resource/view_detail parent operation = %q, want view_detail", got)
+	}
+	if got := resourceOps["query_data"]; got != "query_data" {
+		t.Errorf("resource/query_data parent operation = %q, want query_data", got)
+	}
+	if got := resourceOps["data_write"]; got != "data_write" {
+		t.Errorf("resource/data_write parent operation = %q, want data_write", got)
 	}
 
 	parents := []model.ResourceParent{
@@ -186,12 +203,9 @@ func TestSeedDeclaresKnowledgeNetworkHierarchy(t *testing.T) {
 	assertFinal("default-deny", false, authz.BasisDefault)
 }
 
-// TestSeedDeclaresVegaAuthorizationBoundary keeps the two authorization
-// mechanisms separate. Vega handles its catalog/resource fallback in its own
-// decision points; it must not accidentally become a bkn-safe generic
-// parent_operation hierarchy. The catalog still owns the explicit prerequisite
-// for table management.
-func TestSeedDeclaresVegaAuthorizationBoundary(t *testing.T) {
+// TestSeedDeclaresVegaAuthorizationHierarchy pins the complete Resource-to-Catalog
+// hierarchy so Vega can rely exclusively on bkn-safe's final decisions.
+func TestSeedDeclaresVegaAuthorizationHierarchy(t *testing.T) {
 	db := newDB(t)
 	e, err := authz.New(db)
 	if err != nil {
@@ -205,34 +219,54 @@ func TestSeedDeclaresVegaAuthorizationBoundary(t *testing.T) {
 	if err := db.First(&resource, "id = ?", "resource").Error; err != nil {
 		t.Fatal(err)
 	}
-	if resource.ParentTypeID != "" {
-		t.Fatalf("resource parent = %q; Vega fallback must not use bkn-safe hierarchy", resource.ParentTypeID)
+	if resource.ParentTypeID != "catalog" {
+		t.Fatalf("resource parent = %q, want catalog", resource.ParentTypeID)
 	}
 
 	var operations []model.Operation
 	if err := db.Where("resource_type_id = ?", "resource").Find(&operations).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(operations) != 2 {
-		t.Fatalf("resource operations = %+v, want exactly view_detail and query_data", operations)
+	wantParentOperations := map[string]string{
+		"view_detail": "view_detail",
+		"modify":      "resource_manage",
+		"delete":      "resource_manage",
+		"query_data":  "query_data",
+		"data_write":  "data_write",
+	}
+	if len(operations) != len(wantParentOperations) {
+		t.Fatalf("resource operations = %+v, want exactly %v", operations, wantParentOperations)
 	}
 	for _, operation := range operations {
-		if operation.ID != "view_detail" && operation.ID != "query_data" {
+		wantParent, ok := wantParentOperations[operation.ID]
+		if !ok {
 			t.Errorf("resource unexpectedly declares %q", operation.ID)
+			continue
 		}
-		if operation.ParentOperationID != "" || operation.RequiredOperationIDs != "" {
-			t.Errorf("resource/%s parent=%q requires=%q, want no generic inheritance or prerequisite",
-				operation.ID, operation.ParentOperationID, operation.RequiredOperationIDs)
+		if operation.ParentOperationID != wantParent || operation.RequiredOperationIDs != "" {
+			t.Errorf("resource/%s parent=%q requires=%q, want parent=%q and no prerequisite",
+				operation.ID, operation.ParentOperationID, operation.RequiredOperationIDs, wantParent)
 		}
 	}
 
-	var manage model.Operation
-	if err := db.First(&manage, "resource_type_id = ? AND id = ?", "catalog", "resource_manage").Error; err != nil {
-		t.Fatal(err)
+	for _, operationID := range []string{"modify", "delete", "authorize", "task_manage", "resource_manage"} {
+		var operation model.Operation
+		if err := db.First(&operation, "resource_type_id = ? AND id = ?", "catalog", operationID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if operation.ParentOperationID != "" || operation.RequiredOperationIDs != "view_detail" {
+			t.Errorf("catalog/%s parent=%q requires=%q, want parent empty and requires view_detail",
+				operationID, operation.ParentOperationID, operation.RequiredOperationIDs)
+		}
 	}
-	if manage.ParentOperationID != "" || manage.RequiredOperationIDs != "view_detail" {
-		t.Fatalf("catalog/resource_manage parent=%q requires=%q, want parent empty and requires view_detail",
-			manage.ParentOperationID, manage.RequiredOperationIDs)
+	for _, operationID := range []string{"query_data", "data_write"} {
+		var operation model.Operation
+		if err := db.First(&operation, "resource_type_id = ? AND id = ?", "catalog", operationID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if operation.RequiredOperationIDs != "" {
+			t.Errorf("catalog/%s requires=%q, want independent operation", operationID, operation.RequiredOperationIDs)
+		}
 	}
 }
 
@@ -391,7 +425,6 @@ func TestSeedPrunesWithdrawnOperations(t *testing.T) {
 	// Simulate what an older seed left behind on an upgraded deployment.
 	stale := []model.Operation{
 		{ResourceTypeID: "knowledge_network", ID: "data_query", Name: "数据查询"},
-		{ResourceTypeID: "resource", ID: "modify", Name: "修改"},
 	}
 	if err := db.Create(&stale).Error; err != nil {
 		t.Fatal(err)
@@ -418,6 +451,9 @@ func TestSeedPrunesWithdrawnOperations(t *testing.T) {
 	for _, tc := range []struct{ rtype, op string }{
 		{"resource", "view_detail"},
 		{"resource", "query_data"},
+		{"resource", "data_write"},
+		{"resource", "modify"},
+		{"resource", "delete"},
 		{"catalog", "resource_manage"},
 		{"knowledge_network", "query_data"},
 	} {

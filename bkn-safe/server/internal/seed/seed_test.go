@@ -599,13 +599,13 @@ func TestReconcileWithdrawnNormalUserRole(t *testing.T) {
 }
 
 // TestCatalogResourceOperationSplit pins where each verb lives once #801 has
-// converged: management on the catalog, reading on the table.
+// converged: management on the catalog, reading on the resource.
 //
 // The earlier revision of this test asserted the opposite — that the management
 // verbs were STILL declared on the resource — because Apply wipes every seeded
 // role's p-lines and rebuilds them from grants.json, so removing them before
 // vega judged the catalog would have revoked network_builder's ability to create
-// a table on upgrade. vega has switched, so the assertion inverts.
+// a resource on upgrade. vega has switched, so the assertion inverts.
 func TestCatalogResourceOperationSplit(t *testing.T) {
 	db := newDB(t)
 	e, err := authz.New(db)
@@ -629,30 +629,27 @@ func TestCatalogResourceOperationSplit(t *testing.T) {
 	}
 
 	catalogOps := ops("catalog")
-	for _, op := range []string{"view_detail", "create", "modify", "delete", "authorize", "task_manage", "resource_manage", "query_data"} {
+	for _, op := range []string{"view_detail", "create", "modify", "delete", "authorize", "task_manage", "resource_manage", "query_data", "data_write"} {
 		if !catalogOps[op] {
 			t.Errorf("catalog is missing operation %q", op)
 		}
 	}
 
 	resourceOps := ops("resource")
-	for _, op := range []string{"view_detail", "query_data"} {
+	for _, op := range []string{"view_detail", "query_data", "data_write", "modify", "delete"} {
 		if !resourceOps[op] {
-			t.Errorf("resource is missing read operation %q", op)
+			t.Errorf("resource is missing operation %q", op)
 		}
 	}
-	// The management verbs are gone from the table. Putting one back would give
-	// the vocabulary two answers to "who may change this table" — the catalog's
-	// resource_manage and a table-level verb — and only the first is the one vega
-	// asks. create is the clearest case: a table is always created inside a
-	// catalog, so a verb on the table could never say which catalog it lands in.
-	for _, op := range []string{"create", "modify", "delete", "authorize", "task_manage"} {
+	// create cannot be an instance operation because a new resource has no ID;
+	// authorize and task_manage remain catalog-level operations.
+	for _, op := range []string{"create", "authorize", "task_manage"} {
 		if resourceOps[op] {
-			t.Errorf("resource still declares %q — management is judged on the owning catalog now (#801)", op)
+			t.Errorf("resource unexpectedly declares %q", op)
 		}
 	}
-	if len(resourceOps) != 2 {
-		t.Errorf("resource declares %d operations, want exactly view_detail and query_data", len(resourceOps))
+	if len(resourceOps) != 5 {
+		t.Errorf("resource declares %d operations, want view_detail/query_data/data_write/modify/delete", len(resourceOps))
 	}
 }
 
@@ -740,7 +737,7 @@ func TestNetworkBuilderCanCreateButCannotManageOtherCatalogs(t *testing.T) {
 			t.Errorf("network_builder lost type-wide catalog/%s", op)
 		}
 	}
-	for _, op := range []string{"view_detail", "modify", "delete", "authorize", "task_manage", "resource_manage", "query_data"} {
+	for _, op := range []string{"view_detail", "modify", "delete", "authorize", "task_manage", "resource_manage", "query_data", "data_write"} {
 		ok, err := e.Check(builder, "catalog", catalog, op)
 		if err != nil {
 			t.Fatal(err)
