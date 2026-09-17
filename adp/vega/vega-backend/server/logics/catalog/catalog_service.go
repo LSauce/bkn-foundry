@@ -110,8 +110,8 @@ func NewCatalogService(appSetting *common.AppSetting) interfaces.CatalogService 
 }
 
 // filterCatalogPermissionsInBatches filters catalog permissions without exceeding the permission-service request size.
-func (cs *catalogService) filterCatalogPermissionsInBatches(ctx context.Context, ids []string,
-	ops []string, allowOperation bool) (map[string]interfaces.PermissionResourceOps, error) {
+func (cs *catalogService) filterCatalogPermissionsInBatches(ctx context.Context, ids []string, ops []string,
+	visibilityMatch string, allowOperation bool) (map[string]interfaces.PermissionResourceOps, error) {
 
 	result := make(map[string]interfaces.PermissionResourceOps, len(ids))
 	for start := 0; start < len(ids); start += catalogAuthResourcePermissionBatchSize {
@@ -119,8 +119,8 @@ func (cs *catalogService) filterCatalogPermissionsInBatches(ctx context.Context,
 		if end > len(ids) {
 			end = len(ids)
 		}
-		matched, err := cs.ps.FilterResources(ctx, interfaces.AUTH_RESOURCE_TYPE_CATALOG, ids[start:end], ops,
-			allowOperation)
+		matched, err := cs.ps.FilterResources(ctx, interfaces.AUTH_RESOURCE_TYPE_CATALOG,
+			ids[start:end], ops, visibilityMatch, allowOperation)
 		if err != nil {
 			return nil, err
 		}
@@ -321,9 +321,9 @@ func (cs *catalogService) createHealthCheckSchedule(ctx context.Context, tx *sql
 	return err
 }
 
-// ListPermittedCatalogIDs returns the IDs permitted for every requested
-// operation, preserving the catalog query's order.
-func (cs *catalogService) ListPermittedCatalogIDs(ctx context.Context, ops []string, allowOperation bool,
+// ListPermittedCatalogIDs returns IDs matching visibilityMatch across the
+// requested operations, preserving the catalog query's order.
+func (cs *catalogService) ListPermittedCatalogIDs(ctx context.Context, ops []string, visibilityMatch string, allowOperation bool,
 	params interfaces.CatalogsQueryParams) ([]string, map[string]interfaces.PermissionResourceOps, error) {
 
 	params.IncludeInternal = interfaces.IsBuiltinAdmin(ctx)
@@ -339,7 +339,7 @@ func (cs *catalogService) ListPermittedCatalogIDs(ctx context.Context, ops []str
 	for _, ref := range refs {
 		all = append(all, ref.CatalogID)
 	}
-	allowed, err := cs.filterCatalogPermissionsInBatches(ctx, all, ops, allowOperation)
+	allowed, err := cs.filterCatalogPermissionsInBatches(ctx, all, ops, visibilityMatch, allowOperation)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -409,7 +409,7 @@ func (cs *catalogService) GetByID(ctx context.Context, id string, withSensitiveF
 	}
 
 	matchResoucesMap, err := cs.ps.FilterResources(ctx, interfaces.AUTH_RESOURCE_TYPE_CATALOG, []string{catalog.ID},
-		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, true)
+		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, interfaces.VISIBILITY_MATCH_ALL, true)
 	if err != nil {
 		span.SetStatus(codes.Error, "Filter resources error")
 		return nil, err
@@ -538,7 +538,7 @@ func (cs *catalogService) GetByIDs(ctx context.Context, ids []string) ([]*interf
 		}
 	}
 	matchResoucesMap, err := cs.ps.FilterResources(ctx, interfaces.AUTH_RESOURCE_TYPE_CATALOG, ids,
-		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, true)
+		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, interfaces.VISIBILITY_MATCH_ALL, true)
 	if err != nil {
 		span.SetStatus(codes.Error, "Filter resources error")
 		return nil, err
@@ -571,7 +571,8 @@ func (cs *catalogService) List(ctx context.Context, params interfaces.CatalogsQu
 	defer span.End()
 
 	ids, matchResourceOpsMap, err := cs.ListPermittedCatalogIDs(ctx,
-		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, true, params)
+		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL, interfaces.OPERATION_TYPE_VIEW_SUMMARY},
+		interfaces.VISIBILITY_MATCH_ANY, true, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "Filter resources error")
 		return []*interfaces.CatalogSummary{}, 0, err
@@ -671,7 +672,8 @@ func (cs *catalogService) ListConnectorTypeStats(ctx context.Context, params int
 		ids = append(ids, ref.CatalogID)
 	}
 	allowed, err := cs.filterCatalogPermissionsInBatches(ctx, ids,
-		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, false)
+		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL, interfaces.OPERATION_TYPE_VIEW_SUMMARY},
+		interfaces.VISIBILITY_MATCH_ANY, false)
 	if err != nil {
 		return nil, err
 	}

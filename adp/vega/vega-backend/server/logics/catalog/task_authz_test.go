@@ -87,11 +87,11 @@ func TestListPermittedCatalogIDs(t *testing.T) {
 
 		ca.EXPECT().ListPermissionRefs(gomock.Any(), gomock.Any()).Return([]interfaces.CatalogPermissionRef{{CatalogID: "cat-1"}, {CatalogID: "cat-2"}}, nil)
 		ps.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_CATALOG,
-			[]string{"cat-1", "cat-2"}, gomock.Any(), true).
+			[]string{"cat-1", "cat-2"}, gomock.Any(), interfaces.VISIBILITY_MATCH_ALL, true).
 			Return(map[string]interfaces.PermissionResourceOps{"cat-1": {ResourceID: "cat-1"}}, nil)
 
 		ids, _, err := cs.ListPermittedCatalogIDs(context.Background(),
-			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true, interfaces.CatalogsQueryParams{})
+			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, interfaces.VISIBILITY_MATCH_ALL, true, interfaces.CatalogsQueryParams{})
 		require.NoError(t, err)
 		assert.Equal(t, []string{"cat-1"}, ids)
 	})
@@ -103,11 +103,11 @@ func TestListPermittedCatalogIDs(t *testing.T) {
 		cs := &catalogService{ca: ca, ps: ps}
 
 		ca.EXPECT().ListPermissionRefs(gomock.Any(), gomock.Any()).Return([]interfaces.CatalogPermissionRef{{CatalogID: "cat-1"}}, nil)
-		ps.EXPECT().FilterResources(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		ps.EXPECT().FilterResources(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(map[string]interfaces.PermissionResourceOps{}, nil)
 
 		ids, _, err := cs.ListPermittedCatalogIDs(context.Background(),
-			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true, interfaces.CatalogsQueryParams{})
+			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, interfaces.VISIBILITY_MATCH_ALL, true, interfaces.CatalogsQueryParams{})
 		require.NoError(t, err)
 		assert.Empty(t, ids)
 	})
@@ -121,12 +121,12 @@ func TestListPermittedCatalogIDs(t *testing.T) {
 		ca.EXPECT().ListPermissionRefs(gomock.Any(), gomock.Any()).
 			Return([]interfaces.CatalogPermissionRef{{CatalogID: "cat-1"}}, nil)
 		ps.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_CATALOG,
-			[]string{"cat-1"}, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, false,
+			[]string{"cat-1"}, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, interfaces.VISIBILITY_MATCH_ALL, false,
 		).
 			Return(map[string]interfaces.PermissionResourceOps{"cat-1": {ResourceID: "cat-1"}}, nil)
 
 		ids, _, err := cs.ListPermittedCatalogIDs(context.Background(),
-			[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, false, interfaces.CatalogsQueryParams{})
+			[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, interfaces.VISIBILITY_MATCH_ALL, false, interfaces.CatalogsQueryParams{})
 		require.NoError(t, err)
 		assert.Equal(t, []string{"cat-1"}, ids)
 	})
