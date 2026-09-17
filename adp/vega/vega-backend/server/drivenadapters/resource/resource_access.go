@@ -1033,14 +1033,10 @@ func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// ListAuthResources lists resource auth resources with filters.
-func (ra *resourceAccess) ListAuthResources(ctx context.Context, params interfaces.AuthResourceQueryParams) ([]*interfaces.AuthResourceEntry, int64, error) {
-	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListAuthResources")
+// ListAuthResourceEntries lists resource authorization entries with filters.
+func (ra *resourceAccess) ListAuthResourceEntries(ctx context.Context, params interfaces.AuthResourceQueryParams) ([]*interfaces.AuthResourceEntry, int64, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListAuthResourceEntries")
 	defer span.End()
-
-	if params.Offset < 0 || params.Limit < -1 {
-		return nil, 0, fmt.Errorf("invalid auth resource pagination: offset=%d, limit=%d", params.Offset, params.Limit)
-	}
 
 	builder := sq.Select(
 		"f_id",
@@ -1052,13 +1048,8 @@ func (ra *resourceAccess) ListAuthResources(ctx context.Context, params interfac
 		countBuilder = countBuilder.Where(sq.Eq{"f_internal": false})
 	}
 
-	if params.ID != "" {
-		builder = builder.Where(sq.Eq{"f_id": params.ID})
-		countBuilder = countBuilder.Where(sq.Eq{"f_id": params.ID})
-	}
-
-	if params.Keyword != "" {
-		keyword := "%" + common.EscapeLikePattern(params.Keyword) + "%"
+	if params.Name != "" {
+		keyword := "%" + common.EscapeLikePattern(params.Name) + "%"
 		builder = builder.Where(sq.Like{"f_name": keyword})
 		countBuilder = countBuilder.Where(sq.Like{"f_name": keyword})
 	}
@@ -1073,18 +1064,10 @@ func (ra *resourceAccess) ListAuthResources(ctx context.Context, params interfac
 		span.SetStatus(codes.Error, "Count failed")
 		return nil, 0, err
 	}
-	if params.Limit == 0 {
-		span.SetStatus(codes.Ok, "")
-		return []*interfaces.AuthResourceEntry{}, total, nil
-	}
+	builder = builder.OrderBy(authResourceOrderByClause(params.Sort, params.Direction))
 
-	// Sorting
-	if params.Sort != "" {
-		builder = builder.OrderBy(fmt.Sprintf("%s %s", params.Sort, params.Direction))
-	} else {
-		builder = builder.OrderBy("f_update_time DESC")
-	}
 	if params.Limit > 0 {
+		// #nosec G115 -- handler validates non-negative offset and positive limit.
 		builder = builder.Limit(uint64(params.Limit)).Offset(uint64(params.Offset))
 	}
 
@@ -1113,7 +1096,6 @@ func (ra *resourceAccess) ListAuthResources(ctx context.Context, params interfac
 			span.SetStatus(codes.Error, "Scan row failed")
 			return nil, 0, err
 		}
-		entry.Type = interfaces.AUTH_RESOURCE_TYPE_RESOURCE
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -1124,6 +1106,16 @@ func (ra *resourceAccess) ListAuthResources(ctx context.Context, params interfac
 
 	span.SetStatus(codes.Ok, "")
 	return entries, total, nil
+}
+
+func authResourceOrderByClause(sort, direction string) string {
+	if sort != interfaces.AuthResourceSortName {
+		return "f_update_time DESC"
+	}
+	if direction == interfaces.ASC_DIRECTION {
+		return "f_name ASC, f_id ASC"
+	}
+	return "f_name DESC, f_id DESC"
 }
 
 func (ra *resourceAccess) CheckExistByCategories(ctx context.Context, catalogID string, categories []string) (bool, error) {

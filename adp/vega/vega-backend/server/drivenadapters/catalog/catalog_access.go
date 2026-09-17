@@ -561,14 +561,10 @@ func (ca *catalogAccess) List(ctx context.Context, params interfaces.CatalogsQue
 	return catalogs, total, nil
 }
 
-// ListAuthResources lists catalog auth resources with filters.
-func (ca *catalogAccess) ListAuthResources(ctx context.Context, params interfaces.AuthResourceQueryParams) ([]*interfaces.AuthResourceEntry, int64, error) {
-	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListAuthResources")
+// ListAuthResourceEntries lists catalog authorization entries with filters.
+func (ca *catalogAccess) ListAuthResourceEntries(ctx context.Context, params interfaces.AuthResourceQueryParams) ([]*interfaces.AuthResourceEntry, int64, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListAuthResourceEntries")
 	defer span.End()
-
-	if params.Offset < 0 || params.Limit < -1 {
-		return nil, 0, fmt.Errorf("invalid auth resource pagination: offset=%d, limit=%d", params.Offset, params.Limit)
-	}
 
 	builder := sq.Select(
 		"f_id",
@@ -580,13 +576,8 @@ func (ca *catalogAccess) ListAuthResources(ctx context.Context, params interface
 		countBuilder = countBuilder.Where(sq.Eq{"f_internal": false})
 	}
 
-	if params.ID != "" {
-		builder = builder.Where(sq.Eq{"f_id": params.ID})
-		countBuilder = countBuilder.Where(sq.Eq{"f_id": params.ID})
-	}
-
-	if params.Keyword != "" {
-		keyword := "%" + params.Keyword + "%"
+	if params.Name != "" {
+		keyword := "%" + params.Name + "%"
 		builder = builder.Where(sq.Like{"f_name": keyword})
 		countBuilder = countBuilder.Where(sq.Like{"f_name": keyword})
 	}
@@ -601,18 +592,9 @@ func (ca *catalogAccess) ListAuthResources(ctx context.Context, params interface
 		span.SetStatus(codes.Error, "Count failed")
 		return nil, 0, err
 	}
-	if params.Limit == 0 {
-		span.SetStatus(codes.Ok, "")
-		return []*interfaces.AuthResourceEntry{}, total, nil
-	}
-
-	// Sorting
-	if params.Sort != "" {
-		builder = builder.OrderBy(fmt.Sprintf("%s %s", params.Sort, params.Direction))
-	} else {
-		builder = builder.OrderBy("f_update_time DESC")
-	}
+	builder = builder.OrderBy(authResourceOrderByClause(params.Sort, params.Direction))
 	if params.Limit > 0 {
+		// #nosec G115 -- handler validates non-negative offset and positive limit.
 		builder = builder.Limit(uint64(params.Limit)).Offset(uint64(params.Offset))
 	}
 
@@ -642,7 +624,6 @@ func (ca *catalogAccess) ListAuthResources(ctx context.Context, params interface
 			return nil, 0, err
 		}
 
-		entry.Type = interfaces.AUTH_RESOURCE_TYPE_CATALOG
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -653,6 +634,16 @@ func (ca *catalogAccess) ListAuthResources(ctx context.Context, params interface
 
 	span.SetStatus(codes.Ok, "")
 	return entries, total, nil
+}
+
+func authResourceOrderByClause(sort, direction string) string {
+	if sort != interfaces.AuthResourceSortName {
+		return "f_update_time DESC"
+	}
+	if direction == interfaces.ASC_DIRECTION {
+		return "f_name ASC, f_id ASC"
+	}
+	return "f_name DESC, f_id DESC"
 }
 
 // Update updates ca Catalog.

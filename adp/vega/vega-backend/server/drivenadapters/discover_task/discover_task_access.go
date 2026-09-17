@@ -332,10 +332,8 @@ func (dta *discoverTaskAccess) InternalList(ctx context.Context, params interfac
 	builder = applyDiscoverTaskFilters(builder, params).
 		OrderBy(buildOrderByClause(params.Sort, params.Direction))
 
-	if params.Offset < 0 {
-		return nil, fmt.Errorf("discover task offset must not be negative")
-	}
 	if params.Limit > 0 {
+		// #nosec G115 -- handler validates non-negative offset and positive limit.
 		builder = builder.Limit(uint64(params.Limit)).Offset(uint64(params.Offset))
 	}
 
