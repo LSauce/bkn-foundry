@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -87,7 +88,6 @@ type evidenceOutcome struct {
 }
 
 var (
-	artifactHashJSON   = sonic.Config{EscapeHTML: false, SortMapKeys: true}.Froze()
 	evidenceHTTPClient = &http.Client{}
 	evidenceInFlight   = make(chan struct{}, maxInFlightEvidenceBatches)
 )
@@ -133,12 +133,37 @@ func HashValue(value any) string {
 }
 
 func hashArtifactContent(value any) (string, error) {
-	raw, err := artifactHashJSON.Marshal(value)
+	raw, err := canonicalArtifactContent(value)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(raw)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// canonicalArtifactContent mirrors Core's artifact-content normalization so the
+// digest remains valid after the artifact crosses the HTTP JSON boundary.
+func canonicalArtifactContent(value any) ([]byte, error) {
+	// Content first crosses the HTTP JSON encoder before Core decodes it. Round
+	// trip here as well so replacement characters for malformed UTF-8 and JSON
+	// number precision have exactly the representation Core will canonicalize.
+	transport, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(transport))
+	decoder.UseNumber()
+	var normalized any
+	if err := decoder.Decode(&normalized); err != nil {
+		return nil, err
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(normalized); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 func EvidenceEnabled() bool {
@@ -240,7 +265,7 @@ func postArtifactWithRetry(
 	if url == "" {
 		return errors.New("BKN Trace artifact URL is not configured")
 	}
-	body, err := sonic.Marshal(artifact)
+	body, err := json.Marshal(artifact)
 	if err != nil {
 		return err
 	}
@@ -293,6 +318,13 @@ func EmitQueryObjectInstanceEvents(ctx context.Context, logger interfaces.Logger
 		return ""
 	}
 	return submitAndReturnFirstEventID(ctx, logger, req, BuildQueryObjectInstanceEvents(ctx, req, resp))
+}
+
+func EmitQueryMetricEvents(ctx context.Context, logger interfaces.Logger, req *interfaces.QueryMetricReq, resp *interfaces.QueryMetricResp) string {
+	if !EvidenceEnabled() {
+		return ""
+	}
+	return submitAndReturnFirstEventID(ctx, logger, req, BuildQueryMetricEvents(ctx, req, resp))
 }
 
 func EmitQueryInstanceSubgraphEvents(ctx context.Context, logger interfaces.Logger, req *interfaces.QueryInstanceSubgraphReq, resp *interfaces.QueryInstanceSubgraphResp) string {
@@ -362,6 +394,13 @@ func EmitSchemaDefinitionEvents(ctx context.Context, logger interfaces.Logger, k
 		return ""
 	}
 	return submitAndReturnFirstEventID(ctx, logger, nil, BuildSchemaDefinitionEvents(ctx, kind, knID, ids, matched))
+}
+
+func EmitSchemaSnapshotEvents(ctx context.Context, logger interfaces.Logger, kind, knID string, ids []string, definition any, complete bool) string {
+	if !EvidenceEnabled() {
+		return ""
+	}
+	return submitAndReturnFirstEventID(ctx, logger, nil, BuildSchemaSnapshotEvents(ctx, kind, knID, ids, definition, complete))
 }
 
 func submitAndReturnFirstEventID(ctx context.Context, logger interfaces.Logger, req any, events []Event) string {
@@ -450,6 +489,46 @@ func BuildQueryObjectInstanceEvents(ctx context.Context, req *interfaces.QueryOb
 		candidateCount = len(resp.Data)
 	}
 	return buildRetrievalEvents(ec, "context.query_object", queryObjectConditionHash(req), candidateCount, queryObjectTruncated(req, resp), refs)
+}
+
+func BuildQueryMetricEvents(ctx context.Context, req *interfaces.QueryMetricReq, resp *interfaces.QueryMetricResp) []Event {
+	ec, ok := contextFromRequest(ctx, nil)
+	if !ok || req == nil || strings.TrimSpace(req.KnID) == "" || strings.TrimSpace(req.MetricID) == "" {
+		return nil
+	}
+	rows := []map[string]any{}
+	if resp != nil {
+		for _, series := range resp.Datas {
+			if series == nil {
+				continue
+			}
+			for index, value := range series.Values {
+				row := map[string]any{"dimensions": series.Labels, "value": value}
+				if index < len(series.Times) {
+					row["time"] = series.Times[index]
+				}
+				if index < len(series.TimeStrs) {
+					row["time_text"] = series.TimeStrs[index]
+				}
+				rows = append(rows, row)
+			}
+		}
+	}
+	metricRef := "metric:" + strings.TrimSpace(req.KnID) + ":" + strings.TrimSpace(req.MetricID)
+	payload := map[string]any{
+		"metric_ref": metricRef, "network_ref": "kn:" + strings.TrimSpace(req.KnID),
+		"dimensions": append([]string(nil), req.AnalysisDimensions...), "conditions": req.Cond,
+		"time": req.Time, "having": req.Having, "order_by": req.OrderBy,
+		"aggregation_definition": "defined_by_metric", "rows": rows, "row_count": len(rows),
+		"complete": resp != nil, "cardinality": "metric_series_rows",
+		"source_refs": []map[string]any{
+			controlledRef("kn:"+strings.TrimSpace(req.KnID), "knowledge_network"),
+			controlledRef(metricRef, "metric"),
+		},
+	}
+	event := buildEvent(ec, "metric.query.completed", "context.query_metric", payload, "", ec.causationEventID)
+	event["bkn.trace.schema.version"] = "2.2.0"
+	return []Event{event}
 }
 
 func BuildQueryInstanceSubgraphEvents(ctx context.Context, req *interfaces.QueryInstanceSubgraphReq, resp *interfaces.QueryInstanceSubgraphResp) []Event {
@@ -741,6 +820,80 @@ func BuildSchemaDefinitionEvents(ctx context.Context, kind, knID string, ids []s
 		})
 	}
 	return buildRetrievalEvents(ec, "context.get_"+kind+"_types", HashValue(strings.Join(ids, "\x00")), matched, false, refs)
+}
+
+func BuildSchemaSnapshotEvents(ctx context.Context, kind, knID string, ids []string, definition any, complete bool) []Event {
+	ec, ok := contextFromRequest(ctx, nil)
+	if !ok || strings.TrimSpace(knID) == "" {
+		return nil
+	}
+	refs := []map[string]any{controlledRef("kn:"+strings.TrimSpace(knID), "knowledge_network")}
+	refType := kind
+	if kind == "network" {
+		refType = "knowledge_network"
+	}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		refs = append(refs, controlledRef(kind+":"+strings.TrimSpace(knID)+":"+id, refType))
+	}
+	payload := map[string]any{
+		"network_ref": "kn:" + strings.TrimSpace(knID), "schema_kind": kind,
+		"definition_refs": refs, "definition_count": schemaDefinitionCount(kind, definition), "complete": schemaSnapshotComplete(kind, definition, complete),
+		"definition": definition, "source_refs": refs,
+	}
+	event := buildEvent(ec, "ontology.schema.snapshot", "context.get_"+kind+"_schema", payload, "", ec.causationEventID)
+	event["bkn.trace.schema.version"] = "2.2.0"
+	return []Event{event}
+}
+
+func schemaDefinitionCount(kind string, definition any) int {
+	if definition == nil {
+		return 0
+	}
+	if kind == "network" {
+		count, _ := mountedCapabilityTotal(definition)
+		return count
+	}
+	value := reflect.ValueOf(definition)
+	for value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return 0
+		}
+		value = value.Elem()
+	}
+	switch value.Kind() {
+	case reflect.Array, reflect.Slice, reflect.Map:
+		return value.Len()
+	default:
+		return 1
+	}
+}
+
+func schemaSnapshotComplete(kind string, definition any, complete bool) bool {
+	if kind != "network" {
+		return complete
+	}
+	_, known := mountedCapabilityTotal(definition)
+	return complete && known
+}
+
+func mountedCapabilityTotal(definition any) (int, bool) {
+	raw, err := json.Marshal(definition)
+	if err != nil {
+		return 0, false
+	}
+	var snapshot struct {
+		MountedCapabilities *struct {
+			Total int `json:"total"`
+		} `json:"mounted_capabilities"`
+	}
+	if err := json.Unmarshal(raw, &snapshot); err != nil || snapshot.MountedCapabilities == nil || snapshot.MountedCapabilities.Total < 0 {
+		return 0, false
+	}
+	return snapshot.MountedCapabilities.Total, true
 }
 
 func buildRetrievalEvents(ec eventContext, operation, queryHash string, candidateCount int, truncated bool, refs []map[string]any) []Event {

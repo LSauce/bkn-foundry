@@ -12,6 +12,7 @@ import (
 	validator "github.com/go-playground/validator/v10"
 	"github.com/mark3labs/mcp-go/mcp"
 	"log"
+	"strings"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/bkntrace"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
@@ -642,6 +643,7 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 			log.Printf("WARN: get_kn_detail capability bindings unreadable for kn %s: %v", knID, err)
 		}
 		resp.Slim(getStringArg(req, "detail_level", interfaces.DetailLevelSummary))
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "network", knID, nil, resp, true)
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -708,7 +710,7 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 		if err := metrics.AttachRelatedMetrics(ctx, knID, matched); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		bkntrace.EmitSchemaDefinitionEvents(ctx, nil, "object", knID, args.IDs, len(matched))
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "object", knID, schemaObjectTypeIDs(matched), matched, len(matched) == len(args.IDs))
 		resp := &interfaces.ObjectTypesResp{KnID: knID, ObjectTypes: matched}
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
@@ -742,7 +744,7 @@ func handleGetRelationTypes(bkn interfaces.BknBackendAccess) func(ctx context.Co
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		bkntrace.EmitSchemaDefinitionEvents(ctx, nil, "relation", knID, args.IDs, len(matched))
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "relation", knID, schemaRelationTypeIDs(matched), matched, len(matched) == len(args.IDs))
 		resp := &interfaces.RelationTypesResp{KnID: knID, RelationTypes: matched}
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
@@ -750,6 +752,26 @@ func handleGetRelationTypes(bkn interfaces.BknBackendAccess) func(ctx context.Co
 		}
 		return result, nil
 	}
+}
+
+func schemaObjectTypeIDs(items []*interfaces.ObjectType) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != nil && strings.TrimSpace(item.ID) != "" {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
+}
+
+func schemaRelationTypeIDs(items []*interfaces.RelationType) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != nil && strings.TrimSpace(item.ID) != "" {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
 }
 
 func getKnIDFromHeader(req mcp.CallToolRequest) string {
@@ -817,6 +839,7 @@ func handleQueryMetric(service knmetrics.KnMetricsService) func(ctx context.Cont
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		bkntrace.EmitQueryMetricEvents(ctx, nil, args, resp)
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil

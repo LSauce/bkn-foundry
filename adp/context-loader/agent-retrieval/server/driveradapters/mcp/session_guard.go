@@ -43,6 +43,7 @@ type operationIntent struct {
 type operationResult struct {
 	Operation        any             `json:"operation"`
 	Receipt          any             `json:"receipt"`
+	ArtifactRefs     []string        `json:"-"`
 	Created          bool            `json:"created"`
 	Execute          bool            `json:"execute"`
 	LifecycleContext context.Context `json:"-"`
@@ -306,19 +307,31 @@ func parseBusinessRefs(value any, currentKnID string) ([]bkntrace.BusinessRef, *
 // tool inputs. It is deliberately capability-specific: answer text, labels and
 // domain names never participate in evidence scope.
 func observedToolBusinessRefs(toolName string, arguments map[string]any, currentKnID string) []bkntrace.BusinessRef {
-	if toolName != toolKeyQueryMetric || currentKnID == "" {
+	if currentKnID == "" {
 		return nil
 	}
 	if inputKnID := stringValue(arguments["kn_id"]); inputKnID != "" && inputKnID != currentKnID {
 		return nil
 	}
-	metricID := stringValue(arguments["metric_id"])
-	if metricID == "" {
-		return nil
-	}
-	return []bkntrace.BusinessRef{
+	refs := []bkntrace.BusinessRef{
 		{RefType: "knowledge_network", RefID: "kn:" + currentKnID, Version: "unversioned"},
-		{RefType: "metric", RefID: "metric:" + currentKnID + ":" + metricID, Version: "unversioned"},
+	}
+	switch toolName {
+	case toolKeyGetKnDetail:
+		return refs
+	case toolKeyGetObjectTypes, toolKeyGetRelationTypes:
+		// These tools accept a display name as well as a canonical ID. The
+		// operation scope records the known network; the schema snapshot records
+		// the actual returned type IDs after lookup and permission filtering.
+		return refs
+	case toolKeyQueryMetric:
+		metricID := stringValue(arguments["metric_id"])
+		if metricID == "" {
+			return nil
+		}
+		return append(refs, bkntrace.BusinessRef{RefType: "metric", RefID: "metric:" + currentKnID + ":" + metricID, Version: "unversioned"})
+	default:
+		return nil
 	}
 }
 

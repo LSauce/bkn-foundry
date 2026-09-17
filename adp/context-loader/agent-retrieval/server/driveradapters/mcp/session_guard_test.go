@@ -1106,6 +1106,76 @@ func TestObservedToolBusinessRefsAddsMetricScopeWithoutDomainKnowledge(t *testin
 	}
 }
 
+func TestObservedToolBusinessRefsAddsSchemaScopeFromValidatedInputs(t *testing.T) {
+	tests := []struct {
+		name      string
+		toolName  string
+		arguments map[string]any
+		want      map[string]bool
+	}{
+		{
+			name:     "knowledge network detail",
+			toolName: toolKeyGetKnDetail,
+			arguments: map[string]any{
+				"kn_id": "network-any",
+			},
+			want: map[string]bool{
+				"knowledge_network\x00kn:network-any": true,
+			},
+		},
+		{
+			name:     "object type definitions",
+			toolName: toolKeyGetObjectTypes,
+			arguments: map[string]any{
+				"kn_id": "network-any", "ids": []any{"product", "inventory"},
+			},
+			want: map[string]bool{
+				"knowledge_network\x00kn:network-any": true,
+			},
+		},
+		{
+			name:     "relation type definitions",
+			toolName: toolKeyGetRelationTypes,
+			arguments: map[string]any{
+				"kn_id": "network-any", "ids": []any{"uses_material"},
+			},
+			want: map[string]bool{
+				"knowledge_network\x00kn:network-any": true,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			refs := observedToolBusinessRefs(tc.toolName, tc.arguments, "network-any")
+			if len(refs) != len(tc.want) {
+				t.Fatalf("derived refs = %#v, want %d refs", refs, len(tc.want))
+			}
+			for _, ref := range refs {
+				if !tc.want[ref.RefType+"\x00"+ref.RefID] {
+					t.Fatalf("unexpected derived ref: %#v", ref)
+				}
+				if ref.Version != "unversioned" {
+					t.Fatalf("derived ref version = %q", ref.Version)
+				}
+			}
+		})
+	}
+}
+
+func TestObservedToolBusinessRefsRejectsMismatchedSchemaNetwork(t *testing.T) {
+	for _, toolName := range []string{toolKeyGetKnDetail, toolKeyGetObjectTypes, toolKeyGetRelationTypes} {
+		t.Run(toolName, func(t *testing.T) {
+			arguments := map[string]any{"kn_id": "other"}
+			if toolName != toolKeyGetKnDetail {
+				arguments["ids"] = []any{"known"}
+			}
+			if refs := observedToolBusinessRefs(toolName, arguments, "network-any"); len(refs) != 0 {
+				t.Fatalf("refs = %#v, want none", refs)
+			}
+		})
+	}
+}
+
 func TestObservedToolBusinessRefsRejectsIncompleteOrMismatchedMetricScope(t *testing.T) {
 	cases := []struct {
 		name      string
