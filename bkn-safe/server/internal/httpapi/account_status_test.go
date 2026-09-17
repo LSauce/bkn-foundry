@@ -37,7 +37,7 @@ func TestAuthorizationDecisionsRequireActiveAccounts(t *testing.T) {
 		{"missing", false},
 	} {
 		t.Run(tc.accessor, func(t *testing.T) {
-			check := do(t, r, http.MethodPost, "/api/safe/v1/authz/check", map[string]any{
+			check := doSingleCheck(t, r, map[string]any{
 				"accessor_id": tc.accessor,
 				"resource":    map[string]string{"type": "agent", "id": "a-1"},
 				"operation":   "use",
@@ -49,30 +49,19 @@ func TestAuthorizationDecisionsRequireActiveAccounts(t *testing.T) {
 				t.Fatalf("check = %d %s, want allowed=%v", check.Code, check.Body.String(), tc.allowed)
 			}
 
-			operations := do(t, r, http.MethodPost, "/api/safe/v1/authz/operations", map[string]any{
-				"accessor_id": tc.accessor,
-				"resource":    map[string]string{"type": "agent", "id": "a-1"},
-			})
-			var operationsBody struct {
-				Operations []string `json:"operations"`
-			}
-			if operations.Code != http.StatusOK || json.Unmarshal(operations.Body.Bytes(), &operationsBody) != nil {
-				t.Fatalf("operations = %d %s", operations.Code, operations.Body.String())
-			}
-			if got := len(operationsBody.Operations) > 0; got != tc.allowed {
-				t.Errorf("operations = %v, want non-empty=%v", operationsBody.Operations, tc.allowed)
-			}
-
 			filter := do(t, r, http.MethodPost, "/api/safe/v1/authz/resource-filter", map[string]any{
-				"accessor_id":          tc.accessor,
-				"resources":            []map[string]string{{"type": "agent", "id": "a-1"}},
-				"candidate_operations": []string{"use"},
+				"accessor_id":        tc.accessor,
+				"resources":          []map[string]string{{"type": "agent", "id": "a-1"}},
+				"include_operations": true,
 			})
 			var filterBody struct {
 				Resources []filterEntry `json:"resources"`
 			}
 			if filter.Code != http.StatusOK || json.Unmarshal(filter.Body.Bytes(), &filterBody) != nil {
 				t.Fatalf("resource-filter = %d %s", filter.Code, filter.Body.String())
+			}
+			if got := len(filterBody.Resources) > 0 && len(filterBody.Resources[0].Operations) > 0; got != tc.allowed {
+				t.Errorf("resource-filter = %v, want non-empty operations=%v", filterBody.Resources, tc.allowed)
 			}
 			if got := len(filterBody.Resources) > 0; got != tc.allowed {
 				t.Errorf("resource-filter = %v, want non-empty=%v", filterBody.Resources, tc.allowed)
@@ -117,7 +106,7 @@ func TestDefaultModelAccessRequiresAnEnabledAccount(t *testing.T) {
 		{"model-disabled", "large_model", "display", false},
 		{"missing-model-user", "small_model", "execute", false},
 	} {
-		w := do(t, r, http.MethodPost, "/api/safe/v1/authz/check", map[string]any{
+		w := doSingleCheck(t, r, map[string]any{
 			"accessor_id": tc.accessor,
 			"resource":    map[string]string{"type": tc.resourceType, "id": "model-1"},
 			"operation":   tc.operation,
@@ -163,7 +152,7 @@ func TestAuthorizationAccountStoreFailureIsUnavailable(t *testing.T) {
 	if err := sqlDB.Close(); err != nil {
 		t.Fatal(err)
 	}
-	w := do(t, r, http.MethodPost, "/api/safe/v1/authz/check", map[string]any{
+	w := doSingleCheck(t, r, map[string]any{
 		"accessor_id": "u-1",
 		"resource":    map[string]string{"type": "agent", "id": "a-1"},
 		"operation":   "use",

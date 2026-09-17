@@ -37,23 +37,29 @@ class TestPermissionManagerAuthz(unittest.IsolatedAsyncioTestCase):
     def manager(self, session):
         with mock.patch.dict(
                 "os.environ",
-                {"AUTHZ_PROVIDER": "bkn-safe", "BKN_SAFE_URL": "http://bkn-safe"},
+                {"BKN_SAFE_URL": "http://bkn-safe"},
                 clear=False):
             manager = PermissionManager()
         manager.get_session = mock.AsyncMock(return_value=session)
         return manager
 
     async def test_runtime_check_uses_effective_scope_and_string_resource_id(self):
-        session = _Session([_Response({"allowed": False})])
+        session = _Session([_Response({"allowed": False, "results": [{
+            "resource_type": "small_model", "resource_id": "42",
+            "operation": "execute", "allowed": False,
+        }]})])
         manager = self.manager(session)
         allowed = await manager.check_single_permission(
             "user-1", 42, "execute", "small_model", "user")
 
         self.assertFalse(allowed)
+        self.assertEqual(session.calls[0]["url"], "http://bkn-safe/api/safe/v1/authz/checks")
         self.assertEqual(session.calls[0]["json"], {
             "accessor_id": "user-1",
-            "resource": {"type": "small_model", "id": "42"},
-            "operation": "execute",
+            "checks": [{
+                "resource": {"type": "small_model", "id": "42"},
+                "operation": "execute",
+            }],
             "evaluation_scope": "effective",
         })
 
@@ -86,10 +92,23 @@ class TestPermissionManagerAuthz(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0]["json"]["evaluation_scope"], "effective")
 
     async def test_invalid_safe_check_response_fails_closed(self):
-        manager = self.manager(_Session([_Response({"decision": "allow"})]))
-        allowed = await manager.check_single_permission(
-            "user-1", "model-1", "execute", "small_model", "user")
-        self.assertFalse(allowed)
+        for payload in [
+                {"decision": "allow"},
+                {"allowed": True, "results": []},
+                {"allowed": True, "results": [{
+                    "resource_type": "small_model", "resource_id": "another-model",
+                    "operation": "execute", "allowed": True,
+                }]},
+                {"allowed": True, "results": [{
+                    "resource_type": "small_model", "resource_id": "model-1",
+                    "operation": "execute", "allowed": False,
+                }]},
+        ]:
+            with self.subTest(payload=payload):
+                manager = self.manager(_Session([_Response(payload)]))
+                allowed = await manager.check_single_permission(
+                    "user-1", "model-1", "execute", "small_model", "user")
+                self.assertFalse(allowed)
 
     async def test_invalid_batch_filter_response_fails_closed(self):
         manager = self.manager(_Session([_Response({"result": []})]))

@@ -11,8 +11,15 @@ import "context"
 //go:generate mockgen -source ../interfaces/permission_service.go -destination ../interfaces/mock/mock_permission_service.go
 type PermissionService interface {
 	CheckPermission(ctx context.Context, resource PermissionResource, ops []string) error
-	FilterResources(ctx context.Context, resourceType string, ids []string,
-		ops []string, visibilityMatch string, allowOperation bool) (map[string]PermissionResourceOps, error)
+	CheckPermissions(ctx context.Context, requirements []PermissionRequirement) ([]PermissionCheckResult, error)
+	RequirePermissions(ctx context.Context, requirements []PermissionRequirement) error
+	// FilterVisibleResources returns only resources satisfying the visibility rule.
+	FilterVisibleResources(ctx context.Context, resourceType string, ids []string,
+		visibilityOperations []string, visibilityMatch string) (map[string]PermissionResourceOps, error)
+	// FilterVisibleResourcesWithOperations also returns each visible resource's
+	// complete registry-backed effective operation set.
+	FilterVisibleResourcesWithOperations(ctx context.Context, resourceType string, ids []string,
+		visibilityOperations []string, visibilityMatch string) (map[string]PermissionResourceOps, error)
 
 	CreateResources(ctx context.Context, resources []PermissionResource, ops []string) error
 	DeleteResources(ctx context.Context, resourceType string, ids []string) error

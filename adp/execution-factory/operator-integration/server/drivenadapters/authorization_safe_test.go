@@ -21,15 +21,17 @@ import (
 func fakeAuthz(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/safe/v1/authz/check", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/safe/v1/authz/checks", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			AccessorID      string `json:"accessor_id"`
 			EvaluationScope string `json:"evaluation_scope"`
-			Resource        struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-			} `json:"resource"`
-			Operation string `json:"operation"`
+			Checks          []struct {
+				Resource struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+				} `json:"resource"`
+				Operation string `json:"operation"`
+			} `json:"checks"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -37,10 +39,18 @@ func fakeAuthz(t *testing.T) *httptest.Server {
 		}
 		allowed := req.AccessorID == "admin" &&
 			req.EvaluationScope == "effective" &&
-			req.Resource.Type == "skill" &&
-			req.Resource.ID == interfaces.ResourceIDAll &&
-			req.Operation == "view"
-		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": allowed})
+			len(req.Checks) == 1 && req.Checks[0].Resource.Type == "skill" &&
+			req.Checks[0].Resource.ID == interfaces.ResourceIDAll && req.Checks[0].Operation == "view"
+		results := make([]map[string]any, 0, len(req.Checks))
+		for _, check := range req.Checks {
+			results = append(results, map[string]any{
+				"resource_type": check.Resource.Type,
+				"resource_id":   check.Resource.ID,
+				"operation":     check.Operation,
+				"allowed":       allowed,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"allowed": allowed, "results": results})
 	})
 	mux.HandleFunc("/api/safe/v1/authz/resources", func(w http.ResponseWriter, r *http.Request) {
 		accessorID := r.URL.Query().Get("accessor_id")
@@ -67,17 +77,16 @@ func fakeAuthz(t *testing.T) *httptest.Server {
 				ID   string `json:"id"`
 			} `json:"resources"`
 			VisibilityOperations []string `json:"visibility_operations"`
-			CandidateOperations  []string `json:"candidate_operations"`
+			IncludeOperations    bool     `json:"include_operations"`
 			EvaluationScope      string   `json:"evaluation_scope"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		wantCandidates := []string{"view", "modify", "publish", "unpublish", "delete", "authorize"}
 		if req.AccessorID != "u1" || len(req.Resources) != 2 || req.Resources[0].Type != "skill" || req.Resources[0].ID != "s1" ||
 			len(req.VisibilityOperations) != 1 || req.VisibilityOperations[0] != "view" ||
-			!reflect.DeepEqual(req.CandidateOperations, wantCandidates) ||
+			!req.IncludeOperations ||
 			req.EvaluationScope != "effective" {
 			http.Error(w, "unexpected resource filter request", http.StatusBadRequest)
 			return
@@ -90,25 +99,18 @@ func fakeAuthz(t *testing.T) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
-func TestSafeAuthorizationResourceFilterProjectsCandidateOperations(t *testing.T) {
+func TestSafeAuthorizationResourceFilterProjectsCompleteOperations(t *testing.T) {
 	srv := fakeAuthz(t)
 	defer srv.Close()
 
 	resources, err := newSafeAuthorization(srv.URL, testLogger{}).ResourceFilter(context.Background(), &interfaces.AuthResourceFilterRequest{
-		Accessor: &interfaces.AuthAccessor{ID: "u1"},
+		Accessor:          &interfaces.AuthAccessor{ID: "u1"},
+		IncludeOperations: true,
 		Resources: []*interfaces.AuthResource{
 			{ID: "s1", Type: "skill"},
 			{ID: "s2", Type: "skill"},
 		},
 		Operations: []interfaces.AuthOperationType{interfaces.AuthOperationTypeView},
-		CandidateOperations: []interfaces.AuthOperationType{
-			interfaces.AuthOperationTypeView,
-			interfaces.AuthOperationTypeModify,
-			interfaces.AuthOperationTypePublish,
-			interfaces.AuthOperationTypeUnpublish,
-			interfaces.AuthOperationTypeDelete,
-			interfaces.AuthOperationTypeAuthorize,
-		},
 	})
 	if err != nil {
 		t.Fatalf("ResourceFilter: %v", err)
@@ -210,7 +212,12 @@ func TestSafeAuthorizationUsesEffectiveLocale(t *testing.T) {
 		if got := r.Header.Get(sharedrest.AcceptLanguageHeader); got != sharedrest.AmericanEnglish {
 			t.Errorf("Accept-Language = %q, want %q", got, sharedrest.AmericanEnglish)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"allowed": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"allowed": true,
+			"results": []map[string]any{{
+				"resource_type": "skill", "resource_id": "skill-1", "operation": "view", "allowed": true,
+			}},
+		})
 	}))
 	defer server.Close()
 
@@ -226,9 +233,116 @@ func TestSafeAuthorizationUsesEffectiveLocale(t *testing.T) {
 	}
 }
 
+func TestSafeAuthorizationBatchesMultipleOperationChecks(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var body struct {
+			Checks []struct {
+				Operation string `json:"operation"`
+			} `json:"checks"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Checks) != 2 || body.Checks[0].Operation != "view" || body.Checks[1].Operation != "modify" {
+			t.Fatalf("checks = %+v, want one ordered two-item batch", body.Checks)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"allowed": true,
+			"results": []map[string]any{
+				{"resource_type": "skill", "resource_id": "skill-1", "operation": "view", "allowed": true},
+				{"resource_type": "skill", "resource_id": "skill-1", "operation": "modify", "allowed": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	result, err := newSafeAuthorization(server.URL, testLogger{}).OperationCheck(context.Background(), &interfaces.AuthOperationCheckRequest{
+		Accessor: &interfaces.AuthAccessor{ID: "user-1"},
+		Resource: &interfaces.AuthResource{Type: "skill", ID: "skill-1"},
+		Operation: []interfaces.AuthOperationType{
+			interfaces.AuthOperationTypeView,
+			interfaces.AuthOperationTypeModify,
+		},
+	})
+	if err != nil || !result.Result || requests != 1 {
+		t.Fatalf("OperationCheck() = %#v, %v, requests=%d", result, err, requests)
+	}
+}
+
+func TestSafeAuthorizationOperationChecksPreservesOrderedDecisions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			AccessorID      string `json:"accessor_id"`
+			EvaluationScope string `json:"evaluation_scope"`
+			Checks          []struct {
+				Resource  interfaces.AuthResource      `json:"resource"`
+				Operation interfaces.AuthOperationType `json:"operation"`
+			} `json:"checks"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.AccessorID != "user-1" || body.EvaluationScope != "effective" || len(body.Checks) != 2 {
+			t.Fatalf("checks request = %+v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"allowed": false,
+			"results": []map[string]any{
+				{"resource_type": "operator", "resource_id": "op-1", "operation": "delete", "allowed": true},
+				{"resource_type": "operator", "resource_id": "op-2", "operation": "delete", "allowed": false},
+			},
+		})
+	}))
+	defer server.Close()
+
+	response, err := newSafeAuthorization(server.URL, testLogger{}).OperationChecks(
+		context.Background(), &interfaces.AuthOperationChecksRequest{
+			Accessor: &interfaces.AuthAccessor{ID: "user-1"},
+			Checks: []*interfaces.AuthOperationRequirement{
+				{Resource: &interfaces.AuthResource{Type: "operator", ID: "op-1"}, Operation: interfaces.AuthOperationTypeDelete},
+				{Resource: &interfaces.AuthResource{Type: "operator", ID: "op-2"}, Operation: interfaces.AuthOperationTypeDelete},
+			},
+		})
+	if err != nil {
+		t.Fatalf("OperationChecks: %v", err)
+	}
+	if response.Result || len(response.Decisions) != 2 || !response.Decisions[0].Allowed || response.Decisions[1].Allowed {
+		t.Fatalf("OperationChecks = %+v", response)
+	}
+}
+
+func TestSafeAuthorizationResourceFilterCanSkipOperationProjection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IncludeOperations bool `json:"include_operations"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.IncludeOperations {
+			t.Fatal("pure resource filtering must not request operation projection")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"resources": []map[string]any{
+			{"resource_id": "s1", "resource_type": "skill"},
+		}})
+	}))
+	defer server.Close()
+
+	resources, err := newSafeAuthorization(server.URL, testLogger{}).ResourceFilter(context.Background(), &interfaces.AuthResourceFilterRequest{
+		Accessor:   &interfaces.AuthAccessor{ID: "user-1"},
+		Resources:  []*interfaces.AuthResource{{ID: "s1", Type: "skill"}},
+		Operations: []interfaces.AuthOperationType{interfaces.AuthOperationTypeView},
+	})
+	if err != nil || len(resources) != 1 || len(resources[0].Operations) != 0 {
+		t.Fatalf("ResourceFilter() = %+v, %v", resources, err)
+	}
+}
+
 func TestSafeAuthorizationRejectsIncompleteCheckResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{})
+		_ = json.NewEncoder(w).Encode(map[string]any{"allowed": true})
 	}))
 	defer server.Close()
 

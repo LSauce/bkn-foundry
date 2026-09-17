@@ -193,7 +193,7 @@ func (ps *permissionService) FilterQueryData(ctx context.Context,
 		AccessorID:           account.ID,
 		Resources:            resources,
 		VisibilityOperations: []string{interfaces.PermissionOperationQueryData},
-		CandidateOperations:  []string{interfaces.PermissionOperationQueryData},
+		IncludeOperations:    false,
 	})
 	if err != nil {
 		return nil, permissionUnavailable(ctx, err)
@@ -206,7 +206,7 @@ func (ps *permissionService) FilterQueryData(ctx context.Context,
 	}
 	for _, resource := range response.Resources {
 		key := resourceKey(resource.ResourceType, resource.ResourceID)
-		if _, exists := requested[key]; !exists || !contains(resource.Operations, interfaces.PermissionOperationQueryData) {
+		if _, exists := requested[key]; !exists {
 			continue
 		}
 		allowed[key] = interfaces.PermissionResource{Type: resource.ResourceType, ID: resource.ResourceID}
@@ -225,14 +225,15 @@ func (ps *permissionService) RequireQueryData(ctx context.Context, resources []i
 	if err != nil {
 		return permissionDenied(ctx, err.Error())
 	}
-	allowed, err := ps.FilterQueryData(ctx, normalized)
-	if err != nil {
-		return err
+	requirements := make([]interfaces.PermissionRequirement, 0, len(normalized))
+	for _, resource := range normalized {
+		requirements = append(requirements, interfaces.PermissionRequirement{
+			ResourceType: resource.Type,
+			ResourceID:   resource.ID,
+			Operation:    interfaces.PermissionOperationQueryData,
+		})
 	}
-	if len(allowed) != len(normalized) {
-		return permissionDenied(ctx, "query_data was not granted for every required resource")
-	}
-	return nil
+	return ps.RequirePermissions(ctx, requirements)
 }
 
 func (ps *permissionService) RequirePermissions(ctx context.Context,
@@ -253,49 +254,32 @@ func (ps *permissionService) RequirePermissions(ctx context.Context,
 		return permissionUnavailable(ctx, fmt.Errorf("permission access is not configured"))
 	}
 
-	resources := make([]interfaces.PermissionResource, 0, len(normalized))
-	operations := make([]string, 0, len(normalized))
-	seenOperations := make(map[string]struct{}, len(normalized))
+	checks := make([]interfaces.PermissionCheck, 0, len(normalized))
 	for _, requirement := range normalized {
-		resources = append(resources, interfaces.PermissionResource{
-			Type: requirement.ResourceType,
-			ID:   requirement.ResourceID,
+		checks = append(checks, interfaces.PermissionCheck{
+			Resource:  interfaces.PermissionResource{Type: requirement.ResourceType, ID: requirement.ResourceID},
+			Operation: requirement.Operation,
 		})
-		if _, exists := seenOperations[requirement.Operation]; !exists {
-			seenOperations[requirement.Operation] = struct{}{}
-			operations = append(operations, requirement.Operation)
-		}
 	}
 
-	response, err := ps.access.FilterResources(ctx, interfaces.PermissionFilterRequest{
-		AccessorID:          account.ID,
-		Resources:           resources,
-		CandidateOperations: operations,
+	response, err := ps.access.CheckPermissions(ctx, interfaces.PermissionChecksRequest{
+		AccessorID: account.ID,
+		Checks:     checks,
 	})
 	if err != nil {
 		return permissionUnavailable(ctx, err)
 	}
 
-	allowed := make(map[string]map[string]struct{}, len(response.Resources))
-	requested := make(map[string]struct{}, len(resources))
-	for _, resource := range resources {
-		requested[resourceKey(resource.Type, resource.ID)] = struct{}{}
+	if len(response.Results) != len(checks) {
+		return permissionUnavailable(ctx, fmt.Errorf("permission checks response count mismatch"))
 	}
-	for _, result := range response.Resources {
-		key := resourceKey(strings.TrimSpace(result.ResourceType), strings.TrimSpace(result.ResourceID))
-		if _, exists := requested[key]; !exists {
-			continue
+	for index, requirement := range normalized {
+		result := response.Results[index]
+		if result.ResourceType != requirement.ResourceType || result.ResourceID != requirement.ResourceID ||
+			result.Operation != requirement.Operation {
+			return permissionUnavailable(ctx, fmt.Errorf("permission checks response shape mismatch"))
 		}
-		if _, exists := allowed[key]; !exists {
-			allowed[key] = make(map[string]struct{}, len(result.Operations))
-		}
-		for _, operation := range result.Operations {
-			allowed[key][strings.TrimSpace(operation)] = struct{}{}
-		}
-	}
-	for _, requirement := range normalized {
-		operationsForResource := allowed[resourceKey(requirement.ResourceType, requirement.ResourceID)]
-		if _, exists := operationsForResource[requirement.Operation]; !exists {
+		if !result.Allowed {
 			return permissionDenied(ctx, fmt.Sprintf("%s was not granted for %s:%s",
 				requirement.Operation, requirement.ResourceType, requirement.ResourceID))
 		}
@@ -372,15 +356,6 @@ func normalizeRequirements(requirements []interfaces.PermissionRequirement) ([]i
 
 func resourceKey(resourceType, resourceID string) string {
 	return resourceType + "\x00" + resourceID
-}
-
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func permissionDenied(ctx context.Context, detail string) error {

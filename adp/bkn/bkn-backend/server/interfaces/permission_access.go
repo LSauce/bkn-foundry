@@ -62,6 +62,31 @@ type PermissionCheck struct {
 	Operations []string           `json:"operation"`
 }
 
+// PermissionRequirement is one exact resource-operation authorization
+// requirement. Multiple requirements are evaluated atomically by bkn-safe's
+// /checks endpoint.
+type PermissionRequirement struct {
+	Resource  PermissionResource `json:"resource"`
+	Operation string             `json:"operation"`
+}
+
+type PermissionChecksRequest struct {
+	AccessorID string                  `json:"accessor_id"`
+	Checks     []PermissionRequirement `json:"checks"`
+}
+
+type PermissionCheckResult struct {
+	ResourceType string `json:"resource_type"`
+	ResourceID   string `json:"resource_id"`
+	Operation    string `json:"operation"`
+	Allowed      bool   `json:"allowed"`
+}
+
+type PermissionChecksResponse struct {
+	Allowed bool                    `json:"allowed"`
+	Results []PermissionCheckResult `json:"results"`
+}
+
 // PermissionAccessor identifies an accessor.
 type PermissionAccessor struct {
 	Type string `json:"type,omitempty"` // user for a named user, app for an application account
@@ -129,18 +154,15 @@ func IsValidAuthorizationID(id string) bool {
 // PermissionResourcesFilter is used for filtering and deletion.
 //
 // Operations determine visibility: a resource must hold all listed operations
-// to be returned. CandidateOperations optionally narrows the projected
-// operations for trusted transport callers; when empty, bkn-safe derives the
-// complete resource-type operation set from its authorization catalog.
+// to be returned. When operation projection is enabled, bkn-safe returns the
+// complete effective operation set from its authorization catalog.
 type PermissionResourcesFilter struct {
 	Accessor   PermissionAccessor   `json:"accessor,omitempty"`
 	Resources  []PermissionResource `json:"resources,omitempty"`
 	Operations []string             `json:"operation,omitempty"`
-	// AllowOperation selects the independent operation-projection axis. False
+	// IncludeOperations selects the independent operation-projection axis. False
 	// returns visible resources only; true returns each resource's effective ops.
-	AllowOperation bool `json:"allow_operation"`
-	// CandidateOperations is an optional adapter-only projection hint.
-	CandidateOperations []string `json:"-"`
+	IncludeOperations bool `json:"include_operations"`
 }
 
 // PermissionPolicy describes a policy to apply.
@@ -204,6 +226,7 @@ type PropertyAccessDecision struct {
 //go:generate mockgen -source ../interfaces/permission_access.go -destination ../interfaces/mock/mock_permission_access.go
 type PermissionAccess interface {
 	CheckPermission(ctx context.Context, check PermissionCheck) (bool, error)
+	CheckPermissions(ctx context.Context, request PermissionChecksRequest) (PermissionChecksResponse, error)
 	FilterResources(ctx context.Context, filter PermissionResourcesFilter) (map[string]PermissionResourceOps, error)
 	ResolvePropertyLevels(ctx context.Context, request PropertyLevelsRequest) (PropertyLevelsResponse, error)
 

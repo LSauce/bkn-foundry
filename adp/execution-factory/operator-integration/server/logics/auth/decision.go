@@ -208,6 +208,53 @@ func (s *authServiceImpl) OperationCheckAny(
 	return false, nil
 }
 
+// OperationCheckBatch evaluates exact resource-operation requirements in one
+// authorization request. Denials are returned as decisions; transport or
+// malformed-response failures are surfaced as authorization-unavailable errors.
+func (s *authServiceImpl) OperationCheckBatch(ctx context.Context, accessor *interfaces.AuthAccessor,
+	requirements []*interfaces.AuthOperationRequirement) ([]*interfaces.AuthOperationCheckDecision, error) {
+	if len(requirements) == 0 {
+		return []*interfaces.AuthOperationCheckDecision{}, nil
+	}
+	response, err := s.authorization.OperationChecks(ctx, &interfaces.AuthOperationChecksRequest{
+		Accessor: accessor,
+		Checks:   requirements,
+	})
+	if err != nil {
+		s.logger.WithContext(ctx).Errorf("[OperationCheckBatch] authorization checks failed: %v", err)
+		return nil, oerrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
+			oerrors.ErrExtCommonAuthorizationUnavailable, nil)
+	}
+	if response == nil || len(response.Decisions) != len(requirements) {
+		s.logger.WithContext(ctx).Errorf("[OperationCheckBatch] authorization checks returned an invalid response")
+		return nil, oerrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
+			oerrors.ErrExtCommonAuthorizationUnavailable, nil)
+	}
+	return response.Decisions, nil
+}
+
+func (s *authServiceImpl) CheckResourceOperations(ctx context.Context, accessor *interfaces.AuthAccessor,
+	resourceIDs []string, resourceType interfaces.AuthResourceType,
+	operation interfaces.AuthOperationType) (map[string]bool, error) {
+
+	requirements := make([]*interfaces.AuthOperationRequirement, 0, len(resourceIDs))
+	for _, resourceID := range resourceIDs {
+		requirements = append(requirements, &interfaces.AuthOperationRequirement{
+			Resource:  &interfaces.AuthResource{ID: resourceID, Type: string(resourceType)},
+			Operation: operation,
+		})
+	}
+	decisions, err := s.OperationCheckBatch(ctx, accessor, requirements)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(decisions))
+	for _, decision := range decisions {
+		allowed[decision.ResourceID] = decision.Allowed
+	}
+	return allowed, nil
+}
+
 // ResourceFilterIDs resource filtering.
 func (s *authServiceImpl) ResourceFilterIDs(
 	ctx context.Context,
@@ -217,11 +264,11 @@ func (s *authServiceImpl) ResourceFilterIDs(
 	operations ...interfaces.AuthOperationType,
 ) ([]string, error) {
 	req := &interfaces.AuthResourceFilterRequest{
-		Accessor:            accessor,
-		Resources:           []*interfaces.AuthResource{},
-		Operations:          operations,
-		CandidateOperations: operations,
-		Method:              interfaces.AuthMethodGet,
+		Accessor:          accessor,
+		Resources:         []*interfaces.AuthResource{},
+		Operations:        operations,
+		IncludeOperations: false,
+		Method:            interfaces.AuthMethodGet,
 	}
 
 	for _, resourceID := range resourceIDS {
@@ -242,16 +289,14 @@ func (s *authServiceImpl) ResourceFilterIDs(
 	return resourceIDs, nil
 }
 
-// ResourceFilterOperations returns the candidate operations held on each resource that is
-// visible to the accessor. The caller supplies explicit candidates so list rendering cannot
-// accidentally infer instance permissions from a type-wide grant.
+// ResourceFilterOperations returns the complete effective operation set held on
+// each resource that is visible to the accessor.
 func (s *authServiceImpl) ResourceFilterOperations(
 	ctx context.Context,
 	accessor *interfaces.AuthAccessor,
 	resourceIDs []string,
 	resourceType interfaces.AuthResourceType,
 	visibilityOperations []interfaces.AuthOperationType,
-	candidateOperations []interfaces.AuthOperationType,
 ) (map[string][]interfaces.AuthOperationType, error) {
 	result := make(map[string][]interfaces.AuthOperationType, len(resourceIDs))
 	if len(resourceIDs) == 0 {
@@ -262,11 +307,11 @@ func (s *authServiceImpl) ResourceFilterOperations(
 		resources = append(resources, &interfaces.AuthResource{ID: resourceID, Type: string(resourceType)})
 	}
 	response, err := s.authorization.ResourceFilter(ctx, &interfaces.AuthResourceFilterRequest{
-		Accessor:            accessor,
-		Resources:           resources,
-		Operations:          visibilityOperations,
-		CandidateOperations: candidateOperations,
-		Method:              interfaces.AuthMethodGet,
+		Accessor:          accessor,
+		Resources:         resources,
+		Operations:        visibilityOperations,
+		IncludeOperations: true,
+		Method:            interfaces.AuthMethodGet,
 	})
 	if err != nil {
 		return nil, err

@@ -39,7 +39,6 @@ func (b *bknSafeStub) server() *httptest.Server {
 		var req struct {
 			Resources            []interfaces.PermissionResource `json:"resources"`
 			VisibilityOperations []string                        `json:"visibility_operations"`
-			CandidateOperations  []string                        `json:"candidate_operations"`
 			IncludeOperations    bool                            `json:"include_operations"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -58,10 +57,7 @@ func (b *bknSafeStub) server() *httptest.Server {
 			}
 			operations := []string{}
 			if allowed && req.IncludeOperations {
-				operations = append(operations, req.CandidateOperations...)
-				if len(operations) == 0 {
-					operations = append(operations, b.catalogOperations...)
-				}
+				operations = append(operations, b.catalogOperations...)
 			}
 			resources = append(resources, map[string]any{
 				"resource_type": resource.Type,
@@ -81,6 +77,71 @@ func resourcesOfType(n int, rtype string) []interfaces.PermissionResource {
 	return out
 }
 
+func TestSafeCheckPermissionBatchesOperations(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/safe/v1/authz/checks" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var request struct {
+			AccessorID string `json:"accessor_id"`
+			Checks     []struct {
+				Resource  interfaces.PermissionResource `json:"resource"`
+				Operation string                        `json:"operation"`
+			} `json:"checks"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode checks request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.AccessorID != "u-1" || len(request.Checks) != 2 ||
+			request.Checks[0].Operation != interfaces.OPERATION_TYPE_VIEW_DETAIL ||
+			request.Checks[1].Operation != interfaces.OPERATION_TYPE_QUERY_DATA {
+			t.Errorf("checks request = %+v", request)
+		}
+		_, _ = w.Write([]byte(`{"allowed":true,"evaluation_scope":"effective","results":[` +
+			`{"resource_type":"object_type","resource_id":"kn-1/orders","operation":"view_detail","allowed":true},` +
+			`{"resource_type":"object_type","resource_id":"kn-1/orders","operation":"query_data","allowed":true}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	access := &safePermissionAccess{safe: newSafeClient(srv.URL)}
+	allowed, err := access.CheckPermission(context.Background(), interfaces.PermissionCheck{
+		Accessor: interfaces.PermissionAccessor{ID: "u-1", Type: interfaces.ACCESSOR_TYPE_USER},
+		Resource: interfaces.PermissionResource{Type: "object_type", ID: "kn-1/orders"},
+		Operations: []string{
+			interfaces.OPERATION_TYPE_VIEW_DETAIL,
+			interfaces.OPERATION_TYPE_QUERY_DATA,
+		},
+	})
+	if err != nil || !allowed {
+		t.Fatalf("CheckPermission() = %v, %v; want allowed", allowed, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("CheckPermission() made %d requests, want one batched request", got)
+	}
+}
+
+func TestSafeCheckPermissionFailsClosedOnDependencyError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	access := &safePermissionAccess{safe: newSafeClient(srv.URL)}
+	allowed, err := access.CheckPermission(context.Background(), interfaces.PermissionCheck{
+		Accessor:   interfaces.PermissionAccessor{ID: "u-1", Type: interfaces.ACCESSOR_TYPE_USER},
+		Resource:   interfaces.PermissionResource{Type: "object_type", ID: "kn-1/orders"},
+		Operations: []string{interfaces.OPERATION_TYPE_VIEW_DETAIL},
+	})
+	if err == nil || allowed {
+		t.Fatalf("CheckPermission() = %v, %v; want denied result with dependency error", allowed, err)
+	}
+}
+
 // The adapter must resolve authorization in bulk: round-trips depend on the
 // number of operations and resource types, never on how many resources are being
 // filtered. Filtering per resource is what made large catalogs time out (#357).
@@ -96,10 +157,10 @@ func TestSafeFilterResourcesIsBulk(t *testing.T) {
 
 		s := &safePermissionAccess{safe: newSafeClient(srv.URL)}
 		got, err := s.FilterResources(ctx, interfaces.PermissionResourcesFilter{
-			Accessor:       interfaces.PermissionAccessor{ID: "acc", Type: interfaces.ACCESSOR_TYPE_USER},
-			Resources:      resourcesOfType(100, interfaces.AUTH_RESOURCE_TYPE_RESOURCE),
-			Operations:     []string{op},
-			AllowOperation: true,
+			Accessor:          interfaces.PermissionAccessor{ID: "acc", Type: interfaces.ACCESSOR_TYPE_USER},
+			Resources:         resourcesOfType(100, interfaces.AUTH_RESOURCE_TYPE_RESOURCE),
+			Operations:        []string{op},
+			IncludeOperations: true,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -120,10 +181,10 @@ func TestSafeFilterResourcesIsBulk(t *testing.T) {
 
 		s := &safePermissionAccess{safe: newSafeClient(srv.URL)}
 		got, err := s.FilterResources(ctx, interfaces.PermissionResourcesFilter{
-			Accessor:       interfaces.PermissionAccessor{ID: "acc", Type: interfaces.ACCESSOR_TYPE_USER},
-			Resources:      resourcesOfType(100, interfaces.AUTH_RESOURCE_TYPE_RESOURCE),
-			Operations:     []string{op},
-			AllowOperation: true,
+			Accessor:          interfaces.PermissionAccessor{ID: "acc", Type: interfaces.ACCESSOR_TYPE_USER},
+			Resources:         resourcesOfType(100, interfaces.AUTH_RESOURCE_TYPE_RESOURCE),
+			Operations:        []string{op},
+			IncludeOperations: true,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -157,11 +218,9 @@ func TestSafeFilterResourcesIsBulk(t *testing.T) {
 
 }
 
-// TestFilterResourcesReportsCandidateOperations 钉住可见性与回报是两个轴:
-// 一张表因为「看得见」而进结果,跟着它回去的操作却应该是候选集里它真正持有的
-// 那些。只解析可见性动词的话,operations 恒等于 view_detail,界面上除了「查看」
-// 之外每个按钮都是暗的——持有取数权与目录管理权的账号也一样。
-func TestFilterResourcesReportsCandidateOperations(t *testing.T) {
+// TestFilterResourcesReportsCompleteOperations ensures a visible resource
+// carries its complete effective operation set.
+func TestFilterResourcesReportsCompleteOperations(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/resource-filter") {
@@ -169,20 +228,13 @@ func TestFilterResourcesReportsCandidateOperations(t *testing.T) {
 			return
 		}
 		var body struct {
-			CandidateOperations []string `json:"candidate_operations"`
-			IncludeOperations   bool     `json:"include_operations"`
+			IncludeOperations bool `json:"include_operations"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode resource-filter request: %v", err)
 		}
-		wantCandidates := []string{
-			interfaces.OPERATION_TYPE_VIEW_DETAIL,
-			interfaces.OPERATION_TYPE_QUERY_DATA,
-			interfaces.OPERATION_TYPE_DELETE,
-		}
-		if !body.IncludeOperations || !reflect.DeepEqual(body.CandidateOperations, wantCandidates) {
-			t.Errorf("resource-filter projection = include:%v candidates:%v, want include:true candidates:%v",
-				body.IncludeOperations, body.CandidateOperations, wantCandidates)
+		if !body.IncludeOperations {
+			t.Error("resource-filter must request complete operation projection")
 		}
 		_, _ = w.Write([]byte(`{"resources":[{"resource_type":"resource","resource_id":"r-1","operations":["view_detail","query_data"]}]}`))
 	}))
@@ -190,15 +242,10 @@ func TestFilterResourcesReportsCandidateOperations(t *testing.T) {
 
 	pa := &safePermissionAccess{safe: newSafeClient(srv.URL)}
 	got, err := pa.FilterResources(context.Background(), interfaces.PermissionResourcesFilter{
-		Accessor:       interfaces.PermissionAccessor{ID: "u-1", Type: "user"},
-		Resources:      []interfaces.PermissionResource{{Type: interfaces.AUTH_RESOURCE_TYPE_RESOURCE, ID: "r-1"}},
-		Operations:     []string{interfaces.OPERATION_TYPE_VIEW_DETAIL},
-		AllowOperation: true,
-		CandidateOperations: []string{
-			interfaces.OPERATION_TYPE_VIEW_DETAIL,
-			interfaces.OPERATION_TYPE_QUERY_DATA,
-			interfaces.OPERATION_TYPE_DELETE,
-		},
+		Accessor:          interfaces.PermissionAccessor{ID: "u-1", Type: "user"},
+		Resources:         []interfaces.PermissionResource{{Type: interfaces.AUTH_RESOURCE_TYPE_RESOURCE, ID: "r-1"}},
+		Operations:        []string{interfaces.OPERATION_TYPE_VIEW_DETAIL},
+		IncludeOperations: true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -222,7 +269,7 @@ func TestFilterResourcesCombinesWildcardOperationWithConcreteRequirement(t *test
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/safe/v1/authz/check":
+		case r.Method == http.MethodPost && r.URL.Path == "/api/safe/v1/authz/checks":
 			// modify on connector_type:* is denied because view_detail exists only
 			// on remote-api, not on the wildcard pseudo-resource.
 			_, _ = w.Write([]byte(`{"allowed":false}`))
@@ -238,7 +285,6 @@ func TestFilterResourcesCombinesWildcardOperationWithConcreteRequirement(t *test
 				AccessorID           string                          `json:"accessor_id"`
 				Resources            []interfaces.PermissionResource `json:"resources"`
 				VisibilityOperations []string                        `json:"visibility_operations"`
-				CandidateOperations  []string                        `json:"candidate_operations"`
 				IncludeOperations    bool                            `json:"include_operations"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -249,13 +295,7 @@ func TestFilterResourcesCombinesWildcardOperationWithConcreteRequirement(t *test
 			if body.AccessorID != "legacy-user" ||
 				!reflect.DeepEqual(body.Resources, []interfaces.PermissionResource{{Type: "connector_type", ID: "remote-api"}}) ||
 				!reflect.DeepEqual(body.VisibilityOperations, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}) ||
-				!body.IncludeOperations ||
-				!reflect.DeepEqual(body.CandidateOperations, []string{
-					interfaces.OPERATION_TYPE_VIEW_DETAIL,
-					interfaces.OPERATION_TYPE_MODIFY,
-					interfaces.OPERATION_TYPE_DELETE,
-					interfaces.OPERATION_TYPE_AUTHORIZE,
-				}) {
+				!body.IncludeOperations {
 				t.Errorf("resource-filter request = %+v", body)
 			}
 			_, _ = w.Write([]byte(`{"resources":[{"resource_type":"connector_type","resource_id":"remote-api","operations":["view_detail","modify","delete","authorize"]}]}`))
@@ -272,13 +312,7 @@ func TestFilterResourcesCombinesWildcardOperationWithConcreteRequirement(t *test
 		Operations: []string{
 			interfaces.OPERATION_TYPE_VIEW_DETAIL,
 		},
-		AllowOperation: true,
-		CandidateOperations: []string{
-			interfaces.OPERATION_TYPE_VIEW_DETAIL,
-			interfaces.OPERATION_TYPE_MODIFY,
-			interfaces.OPERATION_TYPE_DELETE,
-			interfaces.OPERATION_TYPE_AUTHORIZE,
-		},
+		IncludeOperations: true,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -180,8 +180,8 @@ config:
     # string; "0s" disables.
     chainHeadLogInterval: "15m"
     decisionLog:
-      # Record every authorization decision (/authz/check, batch summaries for
-      # /operations and /resource-filter, admin gate and permission points).
+      # Record every authorization decision (/authz/checks, batch summaries for
+      # /resource-filter, admin gate and permission points).
       # Written off the request path; a full queue drops rows, never blocks.
       enabled: true
       # Fraction [0,1] of ALLOW decisions kept. Denies are always kept. Lower

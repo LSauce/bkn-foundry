@@ -32,26 +32,37 @@ func TestProxyExecutionAuthorizationAccessReadsStateAndExactGrant(t *testing.T) 
 			"version":               7,
 		})
 	})
-	mux.HandleFunc("/api/safe/v1/authz/check", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/safe/v1/authz/checks", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			AccessorID string `json:"accessor_id"`
-			Resource   struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-			} `json:"resource"`
-			Operation string `json:"operation"`
+			Checks     []struct {
+				Resource struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+				} `json:"resource"`
+				Operation string `json:"operation"`
+			} `json:"checks"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if request.AccessorID != "proxy-1" || request.Resource.Type != "tool_box" ||
-			request.Resource.ID != "box-1" || request.Operation != "execute" {
+		if request.AccessorID != "proxy-1" || len(request.Checks) != 1 || request.Checks[0].Resource.Type != "tool_box" ||
+			request.Checks[0].Resource.ID != "box-1" || request.Checks[0].Operation != "execute" {
 			t.Errorf("authorization request = %+v", request)
 		}
 		if got := r.Header.Get(common.HeaderBKNRequestID); got != "req_12345678" {
 			t.Errorf("request id = %q, want req_12345678", got)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": true})
+		results := make([]map[string]any, 0, len(request.Checks))
+		for _, check := range request.Checks {
+			results = append(results, map[string]any{
+				"resource_type": check.Resource.Type,
+				"resource_id":   check.Resource.ID,
+				"operation":     check.Operation,
+				"allowed":       true,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"allowed": true, "results": results})
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()

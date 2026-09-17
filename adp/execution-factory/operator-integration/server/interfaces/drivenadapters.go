@@ -320,6 +320,29 @@ type AuthOperationCheckResponse struct {
 	Result bool `json:"result"` // Check results.
 }
 
+// AuthOperationRequirement is one exact resource-operation decision.
+type AuthOperationRequirement struct {
+	Resource  *AuthResource     `json:"resource"`
+	Operation AuthOperationType `json:"operation"`
+}
+
+type AuthOperationChecksRequest struct {
+	Accessor *AuthAccessor               `json:"accessor"`
+	Checks   []*AuthOperationRequirement `json:"checks"`
+}
+
+type AuthOperationCheckDecision struct {
+	ResourceType string            `json:"resource_type"`
+	ResourceID   string            `json:"resource_id"`
+	Operation    AuthOperationType `json:"operation"`
+	Allowed      bool              `json:"allowed"`
+}
+
+type AuthOperationChecksResponse struct {
+	Result    bool                          `json:"result"`
+	Decisions []*AuthOperationCheckDecision `json:"decisions"`
+}
+
 // ResourceListRequest resource listing request.
 type ResourceListRequest struct {
 	Accessor  *AuthAccessor       `json:"accessor"`  // Visitor information.
@@ -330,11 +353,11 @@ type ResourceListRequest struct {
 
 // AuthResourceFilterRequest resource filtering request.
 type AuthResourceFilterRequest struct {
-	Accessor            *AuthAccessor       `json:"accessor"`             // Visitor information.
-	Resources           []*AuthResource     `json:"resources"`            // Resource list.
-	Operations          []AuthOperationType `json:"operation"`            // Operations required for visibility.
-	CandidateOperations []AuthOperationType `json:"candidate_operations"` // Operations to project for every visible resource.
-	Method              string              `json:"method"`               // method.
+	Accessor          *AuthAccessor       `json:"accessor"`           // Visitor information.
+	Resources         []*AuthResource     `json:"resources"`          // Resource list.
+	Operations        []AuthOperationType `json:"operation"`          // Operations required for visibility.
+	IncludeOperations bool                `json:"include_operations"` // Return complete effective operations.
+	Method            string              `json:"method"`             // method.
 }
 
 type AuthOperation struct {
@@ -373,6 +396,8 @@ type AuthResourceResult struct {
 type Authorization interface {
 	// single decision.
 	OperationCheck(ctx context.Context, req *AuthOperationCheckRequest) (*AuthOperationCheckResponse, error)
+	// Batched exact resource-operation decisions.
+	OperationChecks(ctx context.Context, req *AuthOperationChecksRequest) (*AuthOperationChecksResponse, error)
 	// Resource filtering.
 	ResourceFilter(ctx context.Context, req *AuthResourceFilterRequest) ([]*AuthResourceResult, error)
 	// Resource enumeration.

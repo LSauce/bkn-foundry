@@ -30,22 +30,52 @@ func newSafeClient(baseURL string) *safeClient {
 	}
 }
 
-func (c *safeClient) checkOne(ctx context.Context, accessorID, rtype, rid, op string) (bool, error) {
-	var out struct {
-		Allowed *bool `json:"allowed"`
+func (c *safeClient) allowedAll(ctx context.Context, accessorID, rtype, rid string, ops []string) (bool, error) {
+	if len(ops) == 0 {
+		return true, nil
 	}
-	err := c.do(ctx, http.MethodPost, "/api/safe/v1/authz/check", map[string]any{
-		"accessor_id": accessorID,
-		"resource":    map[string]string{"type": rtype, "id": rid},
-		"operation":   op,
-	}, &out)
+	checks := make([]interfaces.PermissionRequirement, 0, len(ops))
+	for _, op := range ops {
+		checks = append(checks, interfaces.PermissionRequirement{
+			Resource:  interfaces.PermissionResource{Type: rtype, ID: rid},
+			Operation: op,
+		})
+	}
+	out, err := c.checkPermissions(ctx, interfaces.PermissionChecksRequest{AccessorID: accessorID, Checks: checks})
 	if err != nil {
 		return false, err
 	}
-	if out.Allowed == nil {
-		return false, fmt.Errorf("invalid bkn-safe check response")
+	return out.Allowed, nil
+}
+
+func (c *safeClient) checkPermissions(ctx context.Context,
+	request interfaces.PermissionChecksRequest) (interfaces.PermissionChecksResponse, error) {
+
+	var response interfaces.PermissionChecksResponse
+	if len(request.Checks) == 0 {
+		response.Allowed = true
+		response.Results = []interfaces.PermissionCheckResult{}
+		return response, nil
 	}
-	return *out.Allowed, nil
+	if err := c.do(ctx, http.MethodPost, "/api/safe/v1/authz/checks", request, &response); err != nil {
+		return response, err
+	}
+	if response.Results == nil || len(response.Results) != len(request.Checks) {
+		return response, fmt.Errorf("invalid bkn-safe checks response")
+	}
+	allAllowed := true
+	for index, check := range request.Checks {
+		result := response.Results[index]
+		if result.ResourceType != check.Resource.Type || result.ResourceID != check.Resource.ID ||
+			result.Operation != check.Operation {
+			return response, fmt.Errorf("invalid bkn-safe checks response")
+		}
+		allAllowed = allAllowed && result.Allowed
+	}
+	if response.Allowed != allAllowed {
+		return response, fmt.Errorf("invalid bkn-safe checks response")
+	}
+	return response, nil
 }
 
 // safeResource is one { type, id } pair in the batch filter request.
@@ -55,11 +85,12 @@ type safeResource struct {
 }
 
 // filterResources runs one batched decision for a whole page: visibility decides
-// which resources come back, candidates decide which operations each carries.
+// which resources come back. When requested, bkn-safe returns complete
+// effective operations for each returned resource.
 // One round trip regardless of resource or operation count — the per-resource,
 // per-operation loop it replaces made list pages scale as N x M (#357).
 func (c *safeClient) filterResources(ctx context.Context, accessorID string,
-	resources []safeResource, visibility, candidates []string, includeOperations bool) (map[string][]string, error) {
+	resources []safeResource, visibility []string, includeOperations bool) (map[string][]string, error) {
 
 	out := map[string][]string{}
 	if len(resources) == 0 {
@@ -75,7 +106,6 @@ func (c *safeClient) filterResources(ctx context.Context, accessorID string,
 		"accessor_id":           accessorID,
 		"resources":             resources,
 		"visibility_operations": visibility,
-		"candidate_operations":  candidates,
 		"include_operations":    includeOperations,
 	}, &resp); err != nil {
 		return nil, err
@@ -109,19 +139,6 @@ func (c *safeClient) deleteResourceParents(ctx context.Context, resourceType str
 		"resource_type": resourceType,
 		"resource_ids":  resourceIDs,
 	}, nil)
-}
-
-func (c *safeClient) allowedAll(ctx context.Context, accessorID, rtype, rid string, ops []string) (bool, error) {
-	for _, op := range ops {
-		ok, err := c.checkOne(ctx, accessorID, rtype, rid, op)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 func (c *safeClient) do(ctx context.Context, method, path string, body, out any) error {
@@ -162,6 +179,11 @@ func (s *safePermissionAccess) CheckPermission(ctx context.Context, check interf
 	return s.safe.allowedAll(ctx, check.Accessor.ID, check.Resource.Type, check.Resource.ID, check.Operations)
 }
 
+func (s *safePermissionAccess) CheckPermissions(ctx context.Context,
+	request interfaces.PermissionChecksRequest) (interfaces.PermissionChecksResponse, error) {
+	return s.safe.checkPermissions(ctx, request)
+}
+
 func (s *safePermissionAccess) ResolvePropertyLevels(ctx context.Context,
 	request interfaces.PropertyLevelsRequest) (interfaces.PropertyLevelsResponse, error) {
 	var response interfaces.PropertyLevelsResponse
@@ -174,7 +196,7 @@ func (s *safePermissionAccess) ResolvePropertyLevels(ctx context.Context,
 	return response, nil
 }
 
-// filterBatch is the shared body of FilterResources and GetResourcesOperations.
+// filterBatch is the shared body of FilterResources.
 func (s *safePermissionAccess) filterBatch(ctx context.Context,
 	filter interfaces.PermissionResourcesFilter, visibility []string,
 	includeOperations bool) (map[string]interfaces.PermissionResourceOps, error) {
@@ -183,8 +205,7 @@ func (s *safePermissionAccess) filterBatch(ctx context.Context,
 	for _, r := range filter.Resources {
 		resources = append(resources, safeResource{Type: r.Type, ID: r.ID})
 	}
-	ops, err := s.safe.filterResources(ctx, filter.Accessor.ID, resources, visibility,
-		filter.CandidateOperations, includeOperations)
+	ops, err := s.safe.filterResources(ctx, filter.Accessor.ID, resources, visibility, includeOperations)
 	if err != nil {
 		return nil, err
 	}
@@ -196,14 +217,7 @@ func (s *safePermissionAccess) filterBatch(ctx context.Context,
 }
 
 func (s *safePermissionAccess) FilterResources(ctx context.Context, filter interfaces.PermissionResourcesFilter) (map[string]interfaces.PermissionResourceOps, error) {
-	return s.filterBatch(ctx, filter, filter.Operations, filter.AllowOperation)
-}
-
-// GetResourcesOperations answers "what may I do on each of these", so no
-// visibility filter — every requested resource comes back, possibly with an
-// empty operation set.
-func (s *safePermissionAccess) GetResourcesOperations(ctx context.Context, filter interfaces.PermissionResourcesFilter) (map[string]interfaces.PermissionResourceOps, error) {
-	return s.filterBatch(ctx, filter, nil, true)
+	return s.filterBatch(ctx, filter, filter.Operations, filter.IncludeOperations)
 }
 
 func (s *safePermissionAccess) CreateResources(ctx context.Context, policies []interfaces.PermissionPolicy) error {

@@ -34,36 +34,29 @@ func newSafeAuthorization(baseURL string, logger interfaces.Logger) *safeAuthori
 
 // checkOne queries bkn-safe for a single (accessor, type:id, op) decision.
 func (s *safeAuthorization) checkOne(ctx context.Context, accessorID, rtype, rid, op string) (bool, error) {
-	var out struct {
-		Allowed *bool `json:"allowed"`
+	return s.allowedAll(ctx, accessorID, rtype, rid, []interfaces.AuthOperationType{interfaces.AuthOperationType(op)})
+}
+
+// allowedAll checks all requested operations in one sparse bkn-safe batch.
+func (s *safeAuthorization) allowedAll(ctx context.Context, accessorID, rtype, rid string, ops []interfaces.AuthOperationType) (bool, error) {
+	if len(ops) == 0 {
+		return true, nil
 	}
-	err := s.post(ctx, "/api/safe/v1/authz/check", map[string]any{
-		"accessor_id":      accessorID,
-		"resource":         map[string]string{"type": rtype, "id": rid},
-		"operation":        op,
-		"evaluation_scope": "effective",
-	}, &out)
+	checks := make([]*interfaces.AuthOperationRequirement, 0, len(ops))
+	for _, op := range ops {
+		checks = append(checks, &interfaces.AuthOperationRequirement{
+			Resource:  &interfaces.AuthResource{Type: rtype, ID: rid},
+			Operation: op,
+		})
+	}
+	response, err := s.OperationChecks(ctx, &interfaces.AuthOperationChecksRequest{
+		Accessor: &interfaces.AuthAccessor{ID: accessorID},
+		Checks:   checks,
+	})
 	if err != nil {
 		return false, err
 	}
-	if out.Allowed == nil {
-		return false, fmt.Errorf("invalid bkn-safe check response")
-	}
-	return *out.Allowed, nil
-}
-
-// allowedAll returns true if the accessor is allowed every operation.
-func (s *safeAuthorization) allowedAll(ctx context.Context, accessorID, rtype, rid string, ops []interfaces.AuthOperationType) (bool, error) {
-	for _, op := range ops {
-		ok, err := s.checkOne(ctx, accessorID, rtype, rid, string(op))
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
-	}
-	return true, nil
+	return response.Result, nil
 }
 
 func (s *safeAuthorization) OperationCheck(ctx context.Context, req *interfaces.AuthOperationCheckRequest) (*interfaces.AuthOperationCheckResponse, error) {
@@ -74,9 +67,66 @@ func (s *safeAuthorization) OperationCheck(ctx context.Context, req *interfaces.
 	return &interfaces.AuthOperationCheckResponse{Result: ok}, nil
 }
 
+func (s *safeAuthorization) OperationChecks(ctx context.Context,
+	req *interfaces.AuthOperationChecksRequest) (*interfaces.AuthOperationChecksResponse, error) {
+	if req == nil || req.Accessor == nil {
+		return nil, fmt.Errorf("authorization checks request requires an accessor")
+	}
+	checks := make([]map[string]any, 0, len(req.Checks))
+	for _, requirement := range req.Checks {
+		if requirement == nil || requirement.Resource == nil {
+			return nil, fmt.Errorf("authorization checks request contains an invalid requirement")
+		}
+		checks = append(checks, map[string]any{
+			"resource":  map[string]string{"type": requirement.Resource.Type, "id": requirement.Resource.ID},
+			"operation": string(requirement.Operation),
+		})
+	}
+	var response struct {
+		Allowed *bool `json:"allowed"`
+		Results []struct {
+			ResourceType string                       `json:"resource_type"`
+			ResourceID   string                       `json:"resource_id"`
+			Operation    interfaces.AuthOperationType `json:"operation"`
+			Allowed      bool                         `json:"allowed"`
+		} `json:"results"`
+	}
+	if err := s.post(ctx, "/api/safe/v1/authz/checks", map[string]any{
+		"accessor_id":      req.Accessor.ID,
+		"checks":           checks,
+		"evaluation_scope": "effective",
+	}, &response); err != nil {
+		return nil, err
+	}
+	if response.Allowed == nil || len(response.Results) != len(req.Checks) {
+		return nil, fmt.Errorf("invalid bkn-safe checks response")
+	}
+	decisions := make([]*interfaces.AuthOperationCheckDecision, 0, len(response.Results))
+	allAllowed := true
+	for index, result := range response.Results {
+		requirement := req.Checks[index]
+		if result.ResourceType != requirement.Resource.Type || result.ResourceID != requirement.Resource.ID ||
+			result.Operation != requirement.Operation {
+			return nil, fmt.Errorf("invalid bkn-safe checks response")
+		}
+		decisions = append(decisions, &interfaces.AuthOperationCheckDecision{
+			ResourceType: result.ResourceType,
+			ResourceID:   result.ResourceID,
+			Operation:    result.Operation,
+			Allowed:      result.Allowed,
+		})
+		allAllowed = allAllowed && result.Allowed
+	}
+	if *response.Allowed != allAllowed {
+		return nil, fmt.Errorf("invalid bkn-safe checks response")
+	}
+	return &interfaces.AuthOperationChecksResponse{Result: *response.Allowed, Decisions: decisions}, nil
+}
+
 // ResourceFilter keeps the resources the accessor is allowed all the visibility operations on
-// and projects the requested candidate operations for each surviving resource in one bkn-safe
-// request. Do not replace this with one check per list row: list pages must remain batch PEPs.
+// and returns every effective operation for each surviving resource in one
+// bkn-safe request. Do not replace this with one check per list row: list pages
+// must remain batch PEPs.
 func (s *safeAuthorization) ResourceFilter(ctx context.Context, req *interfaces.AuthResourceFilterRequest) ([]*interfaces.AuthResourceResult, error) {
 	if req == nil || req.Accessor == nil {
 		return []*interfaces.AuthResourceResult{}, nil
@@ -101,15 +151,11 @@ func (s *safeAuthorization) ResourceFilter(ctx context.Context, req *interfaces.
 	for _, operation := range req.Operations {
 		visibilityOperations = append(visibilityOperations, string(operation))
 	}
-	candidateOperations := make([]string, 0, len(req.CandidateOperations))
-	for _, operation := range req.CandidateOperations {
-		candidateOperations = append(candidateOperations, string(operation))
-	}
 	if err := s.post(ctx, "/api/safe/v1/authz/resource-filter", map[string]any{
 		"accessor_id":           req.Accessor.ID,
 		"resources":             resources,
 		"visibility_operations": visibilityOperations,
-		"candidate_operations":  candidateOperations,
+		"include_operations":    req.IncludeOperations,
 		"evaluation_scope":      "effective",
 	}, &response); err != nil {
 		return nil, err

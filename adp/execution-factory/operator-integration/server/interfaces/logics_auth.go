@@ -131,10 +131,10 @@ type IAuthorizationService interface {
 
 	// ResourceFilterIDs resource filtering.
 	ResourceFilterIDs(ctx context.Context, accessor *AuthAccessor, resourceIDS []string, resourceType AuthResourceType, operations ...AuthOperationType) ([]string, error)
-	// ResourceFilterOperations returns the requested candidate operations for each resource
+	// ResourceFilterOperations returns the complete effective operations for each resource
 	// that satisfies every visibility operation. It is the list-page projection used by
 	// clients to decide which object-level controls to render.
-	ResourceFilterOperations(ctx context.Context, accessor *AuthAccessor, resourceIDs []string, resourceType AuthResourceType, visibilityOperations []AuthOperationType, candidateOperations []AuthOperationType) (map[string][]AuthOperationType, error)
+	ResourceFilterOperations(ctx context.Context, accessor *AuthAccessor, resourceIDs []string, resourceType AuthResourceType, visibilityOperations []AuthOperationType) (map[string][]AuthOperationType, error)
 	// ResourceListIDs resource list.
 	ResourceListIDs(ctx context.Context, accessor *AuthAccessor, resourceType AuthResourceType, operations ...AuthOperationType) ([]string, error)
 
@@ -142,6 +142,8 @@ type IAuthorizationService interface {
 	OperationCheckAll(ctx context.Context, accessor *AuthAccessor, resourceID string, resourceType AuthResourceType, operations ...AuthOperationType) (bool, error)
 	// OperationCheckAny OR relationship, only needs to satisfy any one operation permission.
 	OperationCheckAny(ctx context.Context, accessor *AuthAccessor, resourceID string, resourceType AuthResourceType, operations ...AuthOperationType) (bool, error)
+	OperationCheckBatch(ctx context.Context, accessor *AuthAccessor, requirements []*AuthOperationRequirement) ([]*AuthOperationCheckDecision, error)
+	CheckResourceOperations(ctx context.Context, accessor *AuthAccessor, resourceIDs []string, resourceType AuthResourceType, operation AuthOperationType) (map[string]bool, error)
 	// CreatePolicy creates a policy.
 	CreatePolicy(ctx context.Context, accessor *AuthAccessor, authResource *AuthResource, allow []AuthOperationType, deny []AuthOperationType) error
 	// DeletePolicy delete policy.

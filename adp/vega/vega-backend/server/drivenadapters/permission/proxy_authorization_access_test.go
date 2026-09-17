@@ -60,12 +60,12 @@ func TestProxyAuthorizationAccessGetManagedProxy(t *testing.T) {
 func TestProxyAuthorizationAccessCheckPermission(t *testing.T) {
 	access := &proxyAuthorizationAccess{safe: newSafeTestClient(t, func(w http.ResponseWriter, req *http.Request) {
 		assert.Equal(t, http.MethodPost, req.Method)
-		assert.Equal(t, "/api/safe/v1/authz/check", req.URL.Path)
+		assert.Equal(t, "/api/safe/v1/authz/checks", req.URL.Path)
 		body, err := io.ReadAll(req.Body)
 		require.NoError(t, err)
-		assert.JSONEq(t, `{"accessor_id":"proxy-1","resource":{"type":"resource","id":"resource-1"},"operation":"query_data"}`, string(body))
+		assert.JSONEq(t, `{"accessor_id":"proxy-1","checks":[{"resource":{"type":"resource","id":"resource-1"},"operation":"query_data"}]}`, string(body))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"allowed":true}`)
+		_, _ = io.WriteString(w, `{"allowed":true,"results":[{"resource_type":"resource","resource_id":"resource-1","operation":"query_data","allowed":true}]}`)
 	})}
 
 	allowed, err := access.CheckPermission(context.Background(), "proxy-1", interfaces.ProxyTargetTypeResource, "resource-1", interfaces.OPERATION_TYPE_QUERY_DATA)

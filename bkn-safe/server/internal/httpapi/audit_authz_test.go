@@ -235,7 +235,7 @@ func TestCheckRecordsDecisionsForActiveInactiveAndUnknownAccessors(t *testing.T)
 	}
 	check := func(accessor string) map[string]any {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/api/safe/v1/authz/check", strings.NewReader(`{"accessor_id":"`+accessor+`","resource":{"type":"knowledge_network","id":"kn-1"},"operation":"view_detail"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/safe/v1/authz/checks", strings.NewReader(`{"accessor_id":"`+accessor+`","checks":[{"resource":{"type":"knowledge_network","id":"kn-1"},"operation":"view_detail"}]}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
 		req.Header.Set("x-request-id", "req-"+accessor)
@@ -285,25 +285,13 @@ func TestCheckRecordsDecisionsForActiveInactiveAndUnknownAccessors(t *testing.T)
 	}
 }
 
-func TestOperationsAndResourceFilterRecordOneRowPerCall(t *testing.T) {
+func TestResourceFilterRecordsOneRowPerCall(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
-	if w := do(t, r, http.MethodPost, "/api/safe/v1/authz/operations", map[string]any{
-		"accessor_id": adminSub, "resource": map[string]any{"type": "knowledge_network", "id": "kn-1"},
-	}); w.Code != http.StatusOK {
-		t.Fatalf("operations: want 200, got %d (%s)", w.Code, w.Body.String())
-	}
 	if w := do(t, r, http.MethodPost, "/api/safe/v1/authz/resource-filter", map[string]any{
 		"accessor_id": adminSub, "resource_type": "knowledge_network", "resource_ids": []string{"kn-1", "kn-2", "kn-3"},
-		"visibility_operations": []string{"view_detail"}, "candidate_operations": []string{"view_detail", "delete"},
+		"visibility_operations": []string{"view_detail"}, "include_operations": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("resource-filter: want 200, got %d (%s)", w.Code, w.Body.String())
-	}
-	var ops model.AuthzDecision
-	if err := db.Where("source = ?", decisionSourceOperations).First(&ops).Error; err != nil {
-		t.Fatalf("operations decision: %v", err)
-	}
-	if ops.Operation != "*" || ops.ResourceID != "kn-1" || ops.Detail == "" {
-		t.Fatalf("operations decision facts: %+v", ops)
 	}
 	var filters []model.AuthzDecision
 	if err := db.Where("source = ?", decisionSourceFilter).Find(&filters).Error; err != nil {

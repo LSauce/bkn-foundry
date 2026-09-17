@@ -58,6 +58,15 @@ func NewPermissionServiceImpl(appSetting *common.AppSetting) interfaces.Permissi
 }
 
 func (ps *PermissionServiceImpl) CheckPermission(ctx context.Context, resource interfaces.PermissionResource, ops []string) error {
+	requirements := make([]interfaces.PermissionRequirement, 0, len(ops))
+	for _, operation := range ops {
+		requirements = append(requirements, interfaces.PermissionRequirement{Resource: resource, Operation: operation})
+	}
+	return ps.RequirePermissions(ctx, requirements)
+}
+
+func (ps *PermissionServiceImpl) RequirePermissions(ctx context.Context,
+	requirements []interfaces.PermissionRequirement) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "CheckPermission")
 	defer span.End()
 
@@ -71,15 +80,14 @@ func (ps *PermissionServiceImpl) CheckPermission(ctx context.Context, resource i
 		otellog.LogError(ctx, "CheckPermission missing account ID or type", httpErr)
 		return httpErr
 	}
+	if len(requirements) == 0 {
+		span.SetStatus(codes.Ok, "")
+		return nil
+	}
 
-	// Permission checks are temporarily disabled.
-	ok, err := ps.pa.CheckPermission(ctx, interfaces.PermissionCheck{
-		Accessor: interfaces.PermissionAccessor{
-			ID:   accountInfo.ID,
-			Type: accountInfo.Type,
-		},
-		Resource:   resource,
-		Operations: ops,
+	response, err := ps.pa.CheckPermissions(ctx, interfaces.PermissionChecksRequest{
+		AccessorID: accountInfo.ID,
+		Checks:     requirements,
 	})
 	if err != nil {
 		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
@@ -87,7 +95,7 @@ func (ps *PermissionServiceImpl) CheckPermission(ctx context.Context, resource i
 		otellog.LogError(ctx, "CheckPermission failed", httpErr)
 		return httpErr
 	}
-	if !ok {
+	if !response.Allowed {
 		httpErr := rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
 			WithErrorDetails(localizedPermissionDetail(ctx, "PermissionDenied"))
 		otellog.LogError(ctx, "CheckPermission denied", httpErr)
@@ -384,9 +392,21 @@ func (ps *PermissionServiceImpl) DeleteResourceParents(ctx context.Context, reso
 	return nil
 }
 
-// Filter the resource list.
-func (ps *PermissionServiceImpl) FilterResources(ctx context.Context, resourceType string, ids []string,
-	ops []string, allowOperation bool) (map[string]interfaces.PermissionResourceOps, error) {
+// FilterVisibleResources performs pure visibility filtering.
+func (ps *PermissionServiceImpl) FilterVisibleResources(ctx context.Context, resourceType string, ids []string,
+	visibilityOperations []string) (map[string]interfaces.PermissionResourceOps, error) {
+	return ps.filterResources(ctx, resourceType, ids, visibilityOperations, false)
+}
+
+// FilterVisibleResourcesWithOperations returns visible resources with their
+// complete registry-backed effective operation sets.
+func (ps *PermissionServiceImpl) FilterVisibleResourcesWithOperations(ctx context.Context, resourceType string,
+	ids []string, visibilityOperations []string) (map[string]interfaces.PermissionResourceOps, error) {
+	return ps.filterResources(ctx, resourceType, ids, visibilityOperations, true)
+}
+
+func (ps *PermissionServiceImpl) filterResources(ctx context.Context, resourceType string, ids []string,
+	visibilityOperations []string, includeOperations bool) (map[string]interfaces.PermissionResourceOps, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "FilterPermissionResources")
 	defer span.End()
 
@@ -414,9 +434,9 @@ func (ps *PermissionServiceImpl) FilterResources(ctx context.Context, resourceTy
 			ID:   accountInfo.ID,
 			Type: accountInfo.Type,
 		},
-		Resources:      resources,
-		Operations:     ops,
-		AllowOperation: allowOperation,
+		Resources:         resources,
+		Operations:        visibilityOperations,
+		IncludeOperations: includeOperations,
 	})
 	if err != nil {
 		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
