@@ -13,6 +13,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/permobject"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
 
@@ -263,18 +264,324 @@ func (en *Enforcer) baseEffectiveDecisionsWithIndex(ctx context.Context, accesso
 	return out, nil
 }
 
-// operationDecisionsWithIndex is the sole final batch decision layer used by
-// checks, AllowedOps and resource filtering. It evaluates each direct operation
-// requirement from the same base-effective batch without recursively applying
-// that requirement's own metadata.
-func (en *Enforcer) operationDecisionsWithIndex(ctx context.Context, accessorID string, idx *grantIndex,
+// derivedDecisionsWithIndex calculates child-to-parent operations declared by
+// DerivedToOperationID. A source qualifies only when the requested accessor
+// has an independent direct allow on that exact child instance. In particular,
+// hierarchy fallback, wildcard rules and super-admin access cannot manufacture
+// a parent operation.
+type derivedRule struct {
+	childType string
+	childOp   string
+	parentOp  string
+}
+
+// derivedSourceIDs narrows a child-to-parent derivation to resource instances
+// that have a possible independent direct Core allow. Derived decisions must
+// eventually call localDecisions to retain deny and provenance semantics, but
+// querying every child of every requested parent before that decision turns a
+// catalog list into work proportional to all resources in those catalogs.
+//
+// Object wildcards intentionally do not appear in idx.exact, and bundles are
+// excluded because their local basis is Bundle rather than Direct. ActAll is an
+// exact-instance grant for every operation and therefore remains a candidate.
+func derivedSourceIDs(idx *grantIndex, rules []derivedRule) map[string]map[string][]string {
+	required := map[string]map[string]struct{}{}
+	for _, rule := range rules {
+		if required[rule.childType] == nil {
+			required[rule.childType] = map[string]struct{}{}
+		}
+		required[rule.childType][rule.childOp] = struct{}{}
+	}
+
+	ids := map[string]map[string]map[string]struct{}{}
+	for object, grants := range idx.exact {
+		resourceType, resourceID, ok := strings.Cut(object, ":")
+		if !ok || resourceType == "" || resourceID == "" {
+			continue
+		}
+		operations := required[resourceType]
+		if len(operations) == 0 {
+			continue
+		}
+		for operation := range operations {
+			for _, grant := range grants {
+				if grant.source == PolicySourceCommunityBundle || grant.effect == EffectDeny ||
+					(grant.act != ActAll && grant.act != operation) {
+					continue
+				}
+				if ids[resourceType] == nil {
+					ids[resourceType] = map[string]map[string]struct{}{}
+				}
+				if ids[resourceType][operation] == nil {
+					ids[resourceType][operation] = map[string]struct{}{}
+				}
+				ids[resourceType][operation][resourceID] = struct{}{}
+				break
+			}
+		}
+	}
+
+	out := map[string]map[string][]string{}
+	for resourceType, byOperation := range ids {
+		out[resourceType] = map[string][]string{}
+		for operation, resourceIDs := range byOperation {
+			out[resourceType][operation] = make([]string, 0, len(resourceIDs))
+			for resourceID := range resourceIDs {
+				out[resourceType][operation] = append(out[resourceType][operation], resourceID)
+			}
+			sort.Strings(out[resourceType][operation])
+		}
+	}
+	return out
+}
+
+// derivedCandidateIDs combines the finite direct Core grant set with exact
+// candidates supplied by the optional Enterprise object-rule provider. Both
+// are only candidate sets: localDecisionsWithIndex remains the authority for
+// the final allow/deny result and its provenance.
+func derivedCandidateIDs(ctx context.Context, accessorID string, idx *grantIndex,
+	rules []derivedRule) (map[string]map[string][]string, error) {
+	ids := map[string]map[string]map[string]struct{}{}
+	for resourceType, byOperation := range derivedSourceIDs(idx, rules) {
+		ids[resourceType] = map[string]map[string]struct{}{}
+		for operation, resourceIDs := range byOperation {
+			ids[resourceType][operation] = map[string]struct{}{}
+			for _, resourceID := range resourceIDs {
+				ids[resourceType][operation][resourceID] = struct{}{}
+			}
+		}
+	}
+
+	required := map[string]map[string]struct{}{}
+	for _, rule := range rules {
+		if required[rule.childType] == nil {
+			required[rule.childType] = map[string]struct{}{}
+		}
+		required[rule.childType][rule.childOp] = struct{}{}
+	}
+	for resourceType, operations := range required {
+		for operation := range operations {
+			resourceIDs, err := permobject.DirectResourceIDs(ctx, permobject.DirectResourceIDsRequest{
+				AccessorID: accessorID, AccessorIDs: append([]string(nil), idx.subjects...),
+				ResourceType: resourceType, Op: operation,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(resourceIDs) == 0 {
+				continue
+			}
+			if ids[resourceType] == nil {
+				ids[resourceType] = map[string]map[string]struct{}{}
+			}
+			if ids[resourceType][operation] == nil {
+				ids[resourceType][operation] = map[string]struct{}{}
+			}
+			for _, resourceID := range resourceIDs {
+				if resourceID != "" {
+					ids[resourceType][operation][resourceID] = struct{}{}
+				}
+			}
+		}
+	}
+
+	out := map[string]map[string][]string{}
+	for resourceType, byOperation := range ids {
+		out[resourceType] = map[string][]string{}
+		for operation, resourceIDs := range byOperation {
+			for resourceID := range resourceIDs {
+				out[resourceType][operation] = append(out[resourceType][operation], resourceID)
+			}
+			sort.Strings(out[resourceType][operation])
+		}
+	}
+	return out, nil
+}
+
+// derivedRulesByParent loads static registry metadata once per enforcer.
+// Startup primes it after seeding, so policy checks do not pay for registry
+// discovery on every request. Failed loads are deliberately not cached: a
+// request cancellation or temporary database failure must not deny every
+// subsequent normal authorization decision until process restart.
+func (en *Enforcer) derivedRulesByParent(ctx context.Context) (map[string][]derivedRule, error) {
+	en.derivedRulesMu.Lock()
+	defer en.derivedRulesMu.Unlock()
+	if en.derivedRulesReady {
+		return en.derivedRules, nil
+	}
+
+	var types []model.ResourceType
+	if err := en.db.WithContext(ctx).Where("parent_type_id <> ''").Find(&types).Error; err != nil {
+		return nil, err
+	}
+	parentTypeByChild := make(map[string]string, len(types))
+	for _, resourceType := range types {
+		parentTypeByChild[resourceType.ID] = resourceType.ParentTypeID
+	}
+	var operations []model.Operation
+	if err := en.db.WithContext(ctx).Where("derived_to_operation_id <> ''").Find(&operations).Error; err != nil {
+		return nil, err
+	}
+	rules := map[string][]derivedRule{}
+	for _, operation := range operations {
+		parentType := parentTypeByChild[operation.ResourceTypeID]
+		if parentType == "" {
+			continue
+		}
+		rules[parentType] = append(rules[parentType], derivedRule{
+			childType: operation.ResourceTypeID,
+			childOp:   operation.ID,
+			parentOp:  operation.DerivedToOperationID,
+		})
+	}
+	en.derivedRules = rules
+	en.derivedRulesReady = true
+	return en.derivedRules, nil
+}
+
+// PrimeDerivedRules loads the static authorization-registry derivation
+// metadata. Startup calls this after seeding so request-time decisions do not
+// query the registry. It is safe to call repeatedly.
+func (en *Enforcer) PrimeDerivedRules(ctx context.Context) error {
+	_, err := en.derivedRulesByParent(ctx)
+	return err
+}
+
+func (en *Enforcer) derivedDecisionsWithIndex(ctx context.Context, accessorID string, idx *grantIndex,
 	want map[ResourceRef][]string, validateProvenance bool) (map[ResourceRef]map[string]Evaluation, error) {
-	requires, err := en.requirementsFor(ctx, want)
+	if en.db == nil || idx.superAdmin || len(want) == 0 {
+		return nil, nil
+	}
+	wanted := make(map[string]map[string]bool)
+	for resource, operations := range want {
+		for _, operation := range operations {
+			if wanted[resource.Type] == nil {
+				wanted[resource.Type] = map[string]bool{}
+			}
+			wanted[resource.Type][operation] = true
+		}
+	}
+
+	allRules, err := en.derivedRulesByParent(ctx)
 	if err != nil {
 		return nil, err
 	}
-	expanded := expandWithRequirements(want, requires)
-	base, err := en.baseEffectiveDecisionsWithIndex(ctx, accessorID, idx, expanded)
+	rulesByParent := map[string][]derivedRule{}
+	for parentType, rules := range allRules {
+		for _, rule := range rules {
+			if !wanted[parentType][rule.parentOp] {
+				continue
+			}
+			rulesByParent[parentType] = append(rulesByParent[parentType], rule)
+		}
+	}
+	if len(rulesByParent) == 0 {
+		return nil, nil
+	}
+	// Direct Core grants and optional Enterprise exact-object rules provide the
+	// finite candidate set. Do this before reading resource_parents so a request
+	// for many catalogs does not first materialize every child below them.
+	candidateIDsByTypeAndOperation := map[string]map[string][]string{}
+	for _, rules := range rulesByParent {
+		candidates, err := derivedCandidateIDs(ctx, accessorID, idx, rules)
+		if err != nil {
+			return nil, err
+		}
+		for resourceType, byOperation := range candidates {
+			if candidateIDsByTypeAndOperation[resourceType] == nil {
+				candidateIDsByTypeAndOperation[resourceType] = map[string][]string{}
+			}
+			for operation, resourceIDs := range byOperation {
+				candidateIDsByTypeAndOperation[resourceType][operation] = append(
+					candidateIDsByTypeAndOperation[resourceType][operation], resourceIDs...)
+			}
+		}
+	}
+
+	sourceWant := map[ResourceRef][]string{}
+	type binding struct {
+		source   ResourceRef
+		target   ResourceRef
+		sourceOp string
+		targetOp string
+	}
+	bindings := make([]binding, 0)
+	for parentType, rules := range rulesByParent {
+		parentIDs := make([]string, 0)
+		for resource := range want {
+			if resource.Type == parentType {
+				parentIDs = append(parentIDs, resource.ID)
+			}
+		}
+		if len(parentIDs) == 0 {
+			continue
+		}
+		for _, rule := range rules {
+			candidateIDs := candidateIDsByTypeAndOperation[rule.childType][rule.childOp]
+			if len(candidateIDs) == 0 {
+				continue
+			}
+			for start := 0; start < len(candidateIDs); start += childIDChunk {
+				end := min(start+childIDChunk, len(candidateIDs))
+				var parents []model.ResourceParent
+				if err := en.db.WithContext(ctx).
+					Where("parent_type_id = ? AND parent_id IN ? AND resource_type_id = ? AND resource_id IN ?",
+						parentType, parentIDs, rule.childType, candidateIDs[start:end]).
+					Find(&parents).Error; err != nil {
+					return nil, err
+				}
+				for _, parent := range parents {
+					source := ResourceRef{Type: parent.ResourceTypeID, ID: parent.ResourceID}
+					target := ResourceRef{Type: parent.ParentTypeID, ID: parent.ParentID}
+					sourceWant[source] = append(sourceWant[source], rule.childOp)
+					bindings = append(bindings, binding{
+						source: source, target: target, sourceOp: rule.childOp, targetOp: rule.parentOp,
+					})
+				}
+			}
+		}
+	}
+	if len(sourceWant) == 0 {
+		return nil, nil
+	}
+	for source, operations := range sourceWant {
+		unique := make(map[string]string, len(operations))
+		for _, operation := range operations {
+			unique[operation] = operation
+		}
+		sourceWant[source] = distinctSorted(unique)
+	}
+	local, err := en.localDecisionsWithIndex(ctx, accessorID, idx, sourceWant)
+	if err != nil {
+		return nil, err
+	}
+	if validateProvenance {
+		if err := en.applyManagedProxyProvenanceToBatch(ctx, accessorID, local); err != nil {
+			return nil, err
+		}
+	}
+	out := map[ResourceRef]map[string]Evaluation{}
+	for _, binding := range bindings {
+		decision := local[binding.source][binding.sourceOp]
+		if !decision.Allowed() || decision.Basis != BasisDirect {
+			continue
+		}
+		if out[binding.target] == nil {
+			out[binding.target] = map[string]Evaluation{}
+		}
+		out[binding.target][binding.targetOp] = Evaluation{
+			Scope: ScopeEffective, Decision: DecisionAllow, Basis: BasisDerived,
+		}
+	}
+	return out, nil
+}
+
+// operationDecisionsWithIndex is the sole final batch decision layer used by
+// checks, AllowedOps and resource filtering. Operation requirements constrain
+// authorization writes; they do not change the decision for a saved grant.
+func (en *Enforcer) operationDecisionsWithIndex(ctx context.Context, accessorID string, idx *grantIndex,
+	want map[ResourceRef][]string, validateProvenance bool) (map[ResourceRef]map[string]Evaluation, error) {
+	base, err := en.baseEffectiveDecisionsWithIndex(ctx, accessorID, idx, want)
 	if err != nil {
 		return nil, err
 	}
@@ -283,27 +590,23 @@ func (en *Enforcer) operationDecisionsWithIndex(ctx context.Context, accessorID 
 			return nil, err
 		}
 	}
+	derived, err := en.derivedDecisionsWithIndex(ctx, accessorID, idx, want, validateProvenance)
+	if err != nil {
+		return nil, err
+	}
+	for resource, operations := range derived {
+		for operation, decision := range operations {
+			if base[resource][operation].Basis == BasisDefault {
+				base[resource][operation] = decision
+			}
+		}
+	}
 
 	out := make(map[ResourceRef]map[string]Evaluation, len(want))
 	for resource, operations := range want {
 		out[resource] = make(map[string]Evaluation, len(operations))
 		for _, operation := range operations {
-			decision := base[resource][operation]
-			decision.Requirements = append([]string(nil), requires[resource.Type][operation]...)
-			if decision.Allowed() {
-				for _, required := range decision.Requirements {
-					requirement := base[resource][required]
-					if requirement.Allowed() {
-						continue
-					}
-					decision.Decision = DecisionDeny
-					decision.Basis = BasisRequires
-					decision.DeniedRequirement = required
-					decision.RequirementBasis = requirement.Basis
-					break
-				}
-			}
-			out[resource][operation] = decision
+			out[resource][operation] = base[resource][operation]
 		}
 	}
 	return out, nil
