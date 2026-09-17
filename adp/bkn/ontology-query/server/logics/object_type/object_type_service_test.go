@@ -2048,15 +2048,29 @@ func TestObjectTypeProxyFailureStopsVegaRead(t *testing.T) {
 
 // vegaStubForOTQuery implements interfaces.VegaBackendAccess for tests.
 type vegaStubForOTQuery struct {
-	resp       *interfaces.DatasetQueryResponse
-	err        error
-	lastParams *interfaces.ResourceDataQueryParams
+	resp          *interfaces.DatasetQueryResponse
+	responses     []*interfaces.DatasetQueryResponse
+	err           error
+	errors        []error
+	lastParams    *interfaces.ResourceDataQueryParams
+	paramsHistory []*interfaces.ResourceDataQueryParams
 }
 
 func (v *vegaStubForOTQuery) QueryResourceData(ctx context.Context, resourceID string, params *interfaces.ResourceDataQueryParams) (*interfaces.DatasetQueryResponse, error) {
 	v.lastParams = params
+	v.paramsHistory = append(v.paramsHistory, params)
+	if len(v.errors) > 0 {
+		err := v.errors[0]
+		v.errors = v.errors[1:]
+		return nil, err
+	}
 	if v.err != nil {
 		return nil, v.err
+	}
+	if len(v.responses) > 0 {
+		response := v.responses[0]
+		v.responses = v.responses[1:]
+		return response, nil
 	}
 	return v.resp, nil
 }
