@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/adminwrite"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/auth"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
@@ -76,9 +78,6 @@ func (s *adminWriteServices) RequireAnyPermission(points ...adminwrite.Permissio
 func (s *adminWriteServices) CreateRole(ctx context.Context, spec adminwrite.RoleSpec) (string, error) {
 	name := strings.TrimSpace(spec.Name)
 	nameKey := normalizeRoleName(name)
-	if err := s.rejectRoleNameConflict(ctx, nameKey, ""); err != nil {
-		return "", err
-	}
 	id := spec.ID
 	if id == "" {
 		id = auth.NewID()
@@ -87,46 +86,69 @@ func (s *adminWriteServices) CreateRole(ctx context.Context, spec adminwrite.Rol
 		ID: id, Name: name, NameKey: &nameKey, Description: spec.Description,
 		Source: model.RoleSourceCustom,
 	}
-	if err := s.db.WithContext(ctx).Create(&role).Error; err != nil {
-		return "", s.translateRoleNameUniqueError(ctx, nameKey, "", err)
+	err := s.e.Transaction(ctx, func(tx *authz.PolicyTransaction) error {
+		if err := rejectRoleNameConflict(ctx, tx.DB(), nameKey, ""); err != nil {
+			return err
+		}
+		if err := tx.DB().Create(&role).Error; err != nil {
+			return s.translateRoleNameUniqueError(ctx, nameKey, "", err)
+		}
+		return enqueueRoleAudit(ctx, tx.DB(), role.ID, role.Name, http.StatusCreated)
+	})
+	markRoleAuditHandledIfCommitted(ctx, err)
+	if err != nil {
+		return "", err
 	}
 	return role.ID, nil
 }
 
 // UpdateRole renames/re-describes a custom role. Built-ins are immutable.
 func (s *adminWriteServices) UpdateRole(ctx context.Context, id string, patch adminwrite.RolePatch) error {
-	role, err := s.loadCustomRole(ctx, id)
-	if err != nil {
-		return err
-	}
-	fields := map[string]any{}
-	if patch.Name != nil {
-		name := strings.TrimSpace(*patch.Name)
-		nameKey := normalizeRoleName(name)
-		if err := s.rejectRoleNameConflict(ctx, nameKey, role.ID); err != nil {
+	var role *model.Role
+	err := s.e.Transaction(ctx, func(tx *authz.PolicyTransaction) error {
+		var err error
+		role, err = loadCustomRole(ctx, tx.DB(), id)
+		if err != nil {
 			return err
 		}
-		fields["name"] = name
-		fields["name_key"] = nameKey
-	}
-	if patch.Description != nil {
-		fields["description"] = *patch.Description
-	}
-	if len(fields) == 0 {
-		return adminwrite.ErrNoUpdatableFields
-	}
-	err = s.db.WithContext(ctx).Model(&model.Role{}).Where("id = ?", role.ID).Updates(fields).Error
-	if patch.Name != nil {
-		return s.translateRoleNameUniqueError(ctx, normalizeRoleName(*patch.Name), role.ID, err)
-	}
+		fields := map[string]any{}
+		if patch.Name != nil {
+			name := strings.TrimSpace(*patch.Name)
+			nameKey := normalizeRoleName(name)
+			if err := rejectRoleNameConflict(ctx, tx.DB(), nameKey, role.ID); err != nil {
+				return err
+			}
+			fields["name"] = name
+			fields["name_key"] = nameKey
+			role.Name = name
+		}
+		if patch.Description != nil {
+			fields["description"] = *patch.Description
+		}
+		if len(fields) == 0 {
+			return adminwrite.ErrNoUpdatableFields
+		}
+		if err := tx.DB().Model(&model.Role{}).Where("id = ?", role.ID).Updates(fields).Error; err != nil {
+			if patch.Name != nil {
+				return s.translateRoleNameUniqueError(ctx, normalizeRoleName(*patch.Name), role.ID, err)
+			}
+			return err
+		}
+		return enqueueRoleAudit(ctx, tx.DB(), role.ID, role.Name, http.StatusNoContent)
+	})
+	markRoleAuditHandledIfCommitted(ctx, err)
 	return err
 }
 
 // rejectRoleNameConflict covers both migrated roles (name_key) and legacy rows
 // whose nullable key has not yet been safely backfilled.
 func (s *adminWriteServices) rejectRoleNameConflict(ctx context.Context, nameKey, excludeID string) error {
+	return rejectRoleNameConflict(ctx, s.db, nameKey, excludeID)
+}
+
+func rejectRoleNameConflict(ctx context.Context, db *gorm.DB, nameKey, excludeID string) error {
 	var role model.Role
-	query := s.db.WithContext(ctx).Where("(name_key = ? OR (name_key IS NULL AND LOWER(TRIM(name)) = ?))", nameKey, nameKey)
+	query := db.WithContext(ctx).Where("(name_key = ? OR (name_key IS NULL AND LOWER(TRIM(name)) = ?))", nameKey, nameKey)
 	if excludeID != "" {
 		query = query.Where("id <> ?", excludeID)
 	}
@@ -154,14 +176,21 @@ func (s *adminWriteServices) translateRoleNameUniqueError(ctx context.Context, n
 
 // DeleteRole deletes a custom role and purges its casbin bindings and grants.
 func (s *adminWriteServices) DeleteRole(ctx context.Context, id string) error {
-	role, err := s.loadCustomRole(ctx, id)
-	if err != nil {
-		return err
-	}
-	if err := s.db.WithContext(ctx).Delete(&model.Role{}, "id = ?", role.ID).Error; err != nil {
-		return err
-	}
-	return s.e.RemoveRoleCompletely(role.ID)
+	err := s.e.Transaction(ctx, func(tx *authz.PolicyTransaction) error {
+		role, err := loadCustomRole(ctx, tx.DB(), id)
+		if err != nil {
+			return err
+		}
+		if err := tx.DB().Delete(&model.Role{}, "id = ?", role.ID).Error; err != nil {
+			return err
+		}
+		if err := tx.RemoveRoleCompletely(role.ID); err != nil {
+			return err
+		}
+		return enqueueRoleAudit(ctx, tx.DB(), role.ID, role.Name, http.StatusNoContent)
+	})
+	markRoleAuditHandledIfCommitted(ctx, err)
+	return err
 }
 
 // GrantRolePermission grants a custom role an op over a resource pattern. It
@@ -170,14 +199,21 @@ func (s *adminWriteServices) DeleteRole(ctx context.Context, id string) error {
 // comes from a seeded role binding, never from a grant handed out at runtime,
 // or this route becomes an admin-promotion route.
 func (s *adminWriteServices) GrantRolePermission(ctx context.Context, roleID, resourceType, resourceID, op string) error {
+	return s.GrantRolePermissions(ctx, roleID, resourceType, resourceID, []string{op})
+}
+
+// GrantRolePermissions validates and commits one permission request in one
+// policy transaction, yielding exactly one durable audit event for the HTTP
+// request even when it contains several operations.
+func (s *adminWriteServices) GrantRolePermissions(ctx context.Context, roleID, resourceType, resourceID string, requestedOps []string) error {
 	role, err := s.loadCustomRole(ctx, roleID)
 	if err != nil {
 		return err
 	}
-	if err := rejectWildcardGrant(resourceType, []string{op}); err != nil {
+	if err := rejectWildcardGrant(resourceType, requestedOps); err != nil {
 		return fmt.Errorf("%w: %s", adminwrite.ErrWildcardGrant, err.Error())
 	}
-	if err := rejectTypeWideActionExecute(resourceType, resourceID, []string{op}); err != nil {
+	if err := rejectTypeWideActionExecute(resourceType, resourceID, requestedOps); err != nil {
 		return fmt.Errorf("%w: %s", adminwrite.ErrTypeWideActionExecute, err.Error())
 	}
 	if resourceType == adminConsoleResourceType {
@@ -189,17 +225,28 @@ func (s *adminWriteServices) GrantRolePermission(ctx context.Context, roleID, re
 	// A role granted resource_manage gets its required view_detail (#1121): the
 	// management routes load their target first, so without it the role holds a
 	// verb it can never reach.
-	ops, err := s.e.NormalizeOperations(ctx, resourceType, []string{op})
-	if err != nil {
-		return err
-	}
-	if err := s.e.ValidateGrantableOperations(ctx, resourceType, ops); err != nil {
-		if errors.Is(err, authz.ErrOperationNotGrantable) {
-			return fmt.Errorf("%w: operation is not grantable", adminwrite.ErrInvalid)
+	operations := make([]string, 0, len(requestedOps))
+	for _, op := range requestedOps {
+		ops, err := s.e.NormalizeOperations(ctx, resourceType, []string{op})
+		if err != nil {
+			return err
 		}
-		return err
+		if err := s.e.ValidateGrantableOperations(ctx, resourceType, ops); err != nil {
+			if errors.Is(err, authz.ErrOperationNotGrantable) {
+				return fmt.Errorf("%w: operation is not grantable", adminwrite.ErrInvalid)
+			}
+			return err
+		}
+		operations = append(operations, ops...)
 	}
-	return s.e.GrantNormalizedRolePermissions(ctx, role.ID, resourceType, resourceID, ops)
+	err = s.e.Transaction(ctx, func(tx *authz.PolicyTransaction) error {
+		if err := tx.GrantNormalizedRolePermissions(role.ID, resourceType, resourceID, operations); err != nil {
+			return err
+		}
+		return enqueueRoleAudit(ctx, tx.DB(), role.ID, role.Name, http.StatusNoContent)
+	})
+	markRoleAuditHandledIfCommitted(ctx, err)
+	return err
 }
 
 // RevokeRolePermission revokes one operation.
@@ -231,60 +278,64 @@ func (s *adminWriteServices) RevokeRolePermission(ctx context.Context, roleID, r
 // the next revoke is honoured because nothing left requires view_detail.
 func (s *adminWriteServices) RevokeRolePermissions(ctx context.Context,
 	roleID, resourceType, resourceID string, ops []string) error {
-
-	role, err := s.loadCustomRole(ctx, roleID)
-	if err != nil {
-		return err
-	}
 	if len(ops) == 0 {
 		return nil
 	}
-	held, err := s.roleOperationsOn(role.ID, resourceType, resourceID)
-	if err != nil {
-		return err
-	}
-	// What the role keeps once this request is applied — computed before the
-	// first removal so no operation's verdict can depend on another's.
-	remaining := map[string]bool{}
-	requested := make(map[string]bool, len(ops))
-	for _, op := range ops {
-		requested[op] = true
-	}
-	for op := range held {
-		if !requested[op] {
-			remaining[op] = true
-		}
-	}
-	requiringByOperation, err := s.e.RequiringOperationsByRequirement(ctx, resourceType, ops)
-	if err != nil {
-		return err
-	}
-
-	for _, op := range ops {
-		retainedBy := ""
-		for _, other := range requiringByOperation[op] {
-			if remaining[other] {
-				retainedBy = other
-				break
-			}
-		}
-		if retainedBy != "" {
-			slog.Info("kept an operation another retained role operation requires",
-				"role_id", role.ID, "resource_type", resourceType, "resource_id", resourceID,
-				"operation", op, "required_by", retainedBy)
-			continue
-		}
-		if err := s.e.RevokeRolePermission(role.ID, resourceType, resourceID, op); err != nil {
+	err := s.e.Transaction(ctx, func(tx *authz.PolicyTransaction) error {
+		role, err := loadCustomRole(ctx, tx.DB(), roleID)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		held, err := roleOperationsOn(tx, role.ID, resourceType, resourceID)
+		if err != nil {
+			return err
+		}
+		remaining := map[string]bool{}
+		requested := make(map[string]bool, len(ops))
+		for _, op := range ops {
+			requested[op] = true
+		}
+		for op := range held {
+			if !requested[op] {
+				remaining[op] = true
+			}
+		}
+		requiringByOperation, err := tx.RequiringOperationsByRequirement(ctx, resourceType, ops)
+		if err != nil {
+			return err
+		}
+		for _, op := range ops {
+			retainedBy := ""
+			for _, other := range requiringByOperation[op] {
+				if remaining[other] {
+					retainedBy = other
+					break
+				}
+			}
+			if retainedBy != "" {
+				slog.Info("kept an operation another retained role operation requires",
+					"role_id", role.ID, "resource_type", resourceType, "resource_id", resourceID,
+					"operation", op, "required_by", retainedBy)
+				continue
+			}
+			if err := tx.RevokeRolePermission(role.ID, resourceType, resourceID, op); err != nil {
+				return err
+			}
+		}
+		return enqueueRoleAudit(ctx, tx.DB(), role.ID, role.Name, http.StatusNoContent)
+	})
+	markRoleAuditHandledIfCommitted(ctx, err)
+	return err
 }
 
 // roleOperationsOn returns the operations the role holds on exactly one
 // resource pattern, as a set.
-func (s *adminWriteServices) roleOperationsOn(roleID, resourceType, resourceID string) (map[string]bool, error) {
-	grants, err := s.e.RolePermissions(roleID)
+func roleOperationsOn(tx *authz.PolicyTransaction, roleID, resourceType, resourceID string) (map[string]bool, error) {
+	grants, err := tx.RolePermissions(roleID)
+	return roleOperationsFromGrants(grants, err, resourceType, resourceID)
+}
+
+func roleOperationsFromGrants(grants []authz.RoleGrant, err error, resourceType, resourceID string) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -304,8 +355,13 @@ func (s *adminWriteServices) roleOperationsOn(roleID, resourceType, resourceID s
 // loadCustomRole fetches a role and rejects built-ins. It maps to the
 // adminwrite sentinels so ee need not know the model.
 func (s *adminWriteServices) loadCustomRole(ctx context.Context, id string) (*model.Role, error) {
+	role, err := loadCustomRole(ctx, s.db, id)
+	return role, err
+}
+
+func loadCustomRole(ctx context.Context, db *gorm.DB, id string) (*model.Role, error) {
 	var role model.Role
-	err := s.db.WithContext(ctx).First(&role, "id = ?", id).Error
+	err := db.WithContext(ctx).First(&role, "id = ?", id).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, adminwrite.ErrNotFound
 	}
@@ -316,4 +372,24 @@ func (s *adminWriteServices) loadCustomRole(ctx context.Context, id string) (*mo
 		return nil, adminwrite.ErrImmutable
 	}
 	return &role, nil
+}
+
+func enqueueRoleAudit(ctx context.Context, tx *gorm.DB, targetID, targetName string, status int) error {
+	operation, ok := audit.RequestOperationFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return operation.Enqueue(tx, targetID, targetName, status)
+}
+
+func markRoleAuditHandled(ctx context.Context) {
+	if operation, ok := audit.RequestOperationFromContext(ctx); ok {
+		operation.MarkHandled()
+	}
+}
+
+func markRoleAuditHandledIfCommitted(ctx context.Context, err error) {
+	if err == nil || errors.Is(err, authz.ErrPolicyReloadAfterCommit) {
+		markRoleAuditHandled(ctx)
+	}
 }

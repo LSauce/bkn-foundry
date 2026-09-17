@@ -1016,6 +1016,156 @@ func TestAuditTrail(t *testing.T) {
 	}
 }
 
+func TestRoleManagementSuccessPersistsAuditBeforeChainAppend(t *testing.T) {
+	r, e, db, users := newAdminServer(t)
+	const (
+		securityUser = "role-audited-security-user"
+		securityRole = "role-audited-security-role"
+		memberUser   = "role-audited-member"
+		roleID       = "role-audited-custom"
+	)
+	for _, userID := range []string{securityUser, memberUser} {
+		if err := users.CreateLocalUser(t.Context(), &model.User{ID: userID, Account: userID, Name: userID, Enabled: true}, "pw-init0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grantAdminSurface(t, e, securityRole)
+	grantRoleOps(t, e, securityRole, "admin-role", "create", "edit", "delete", "members", "permissions")
+	bindRole(t, e, securityUser, securityRole)
+	seedCatalogOps(t, db, "catalog", "view_detail")
+
+	request := func(requestID, method, path string, body any, want int) {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req := httptest.NewRequest(method, path, &buf)
+		req.Header.Set("Authorization", "Bearer "+securityUser)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-request-id", requestID)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("%s %s = %d, want %d: %s", method, path, w.Code, want, w.Body.String())
+		}
+		var logs []model.AuditLog
+		if err := db.Where("request_id = ?", requestID).Find(&logs).Error; err != nil {
+			t.Fatal(err)
+		}
+		if len(logs) != 1 {
+			t.Fatalf("request %q audit rows = %d, want 1: %+v", requestID, len(logs), logs)
+		}
+		if logs[0].ActorID != securityUser || logs[0].ChainState != model.AuditChainStatePending || logs[0].Seq != nil {
+			t.Fatalf("request %q audit event = %+v, want pending event by %q", requestID, logs[0], securityUser)
+		}
+	}
+
+	request("role-create", http.MethodPost, "/api/safe/v1/admin/roles", gin.H{"id": roleID, "name": "Initial role"}, http.StatusCreated)
+	request("role-update", http.MethodPut, "/api/safe/v1/admin/roles/"+roleID, gin.H{"name": "Renamed role"}, http.StatusNoContent)
+	permission := gin.H{"resource": gin.H{"type": "catalog", "id": "*"}, "operations": []string{"view_detail"}}
+	request("role-grant", http.MethodPost, "/api/safe/v1/admin/roles/"+roleID+"/permissions", permission, http.StatusNoContent)
+	request("role-revoke", http.MethodDelete, "/api/safe/v1/admin/roles/"+roleID+"/permissions", permission, http.StatusNoContent)
+	binding := gin.H{"accessor_id": memberUser, "role_id": roleID}
+	request("role-bind", http.MethodPost, "/api/safe/v1/admin/role-bindings", binding, http.StatusNoContent)
+	request("role-unbind", http.MethodDelete, "/api/safe/v1/admin/role-bindings", binding, http.StatusNoContent)
+	for _, requestID := range []string{"role-bind", "role-unbind"} {
+		var bindingAudit model.AuditLog
+		if err := db.Where("request_id = ?", requestID).First(&bindingAudit).Error; err != nil {
+			t.Fatal(err)
+		}
+		if bindingAudit.TargetID != memberUser {
+			t.Fatalf("%s target_id = %q, want accessor %q", requestID, bindingAudit.TargetID, memberUser)
+		}
+	}
+	request("role-delete", http.MethodDelete, "/api/safe/v1/admin/roles/"+roleID, nil, http.StatusNoContent)
+
+	var failureBody bytes.Buffer
+	_ = json.NewEncoder(&failureBody).Encode(gin.H{"name": "after-delete"})
+	failureReq := httptest.NewRequest(http.MethodPut, "/api/safe/v1/admin/roles/"+roleID, &failureBody)
+	failureReq.Header.Set("Authorization", "Bearer "+securityUser)
+	failureReq.Header.Set("Content-Type", "application/json")
+	failureReq.Header.Set("x-request-id", "role-update-missing")
+	failureResponse := httptest.NewRecorder()
+	r.ServeHTTP(failureResponse, failureReq)
+	if failureResponse.Code != http.StatusNotFound {
+		t.Fatalf("missing role update = %d, want 404: %s", failureResponse.Code, failureResponse.Body.String())
+	}
+	var failedLogs []model.AuditLog
+	if err := db.Where("request_id = ?", "role-update-missing").Find(&failedLogs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(failedLogs) != 1 || failedLogs[0].Status != http.StatusNotFound {
+		t.Fatalf("missing role update audit = %+v, want exactly one 404 event", failedLogs)
+	}
+}
+
+func TestRolePermissionBatchAuditsOneRequestOutcome(t *testing.T) {
+	r, e, db, users := newAdminServer(t)
+	const (
+		securityUser = "batch-audit-security-user"
+		securityRole = "batch-audit-security-role"
+		roleID       = "batch-audit-role"
+	)
+	if err := users.CreateLocalUser(t.Context(), &model.User{ID: securityUser, Account: securityUser, Enabled: true}, "pw-init0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.Role{ID: roleID, Name: roleID, Source: model.RoleSourceCustom}).Error; err != nil {
+		t.Fatal(err)
+	}
+	grantAdminSurface(t, e, securityRole)
+	grantRoleOps(t, e, securityRole, "admin-role", "permissions")
+	bindRole(t, e, securityUser, securityRole)
+	seedCatalogOps(t, db, "catalog", "view_detail", "resource_manage")
+	notGrantable := false
+	if err := db.Create(&model.Operation{
+		ResourceTypeID: "catalog", ID: "not-grantable", Name: "Not grantable", Grantable: &notGrantable,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	request := func(requestID string, operations []string, want int) {
+		t.Helper()
+		body, err := json.Marshal(gin.H{
+			"resource":   gin.H{"type": "catalog", "id": "*"},
+			"operations": operations,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/safe/v1/admin/roles/"+roleID+"/permissions", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+securityUser)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-request-id", requestID)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("operations %v = %d, want %d: %s", operations, w.Code, want, w.Body.String())
+		}
+		var logs []model.AuditLog
+		if err := db.Where("request_id = ?", requestID).Find(&logs).Error; err != nil {
+			t.Fatal(err)
+		}
+		if len(logs) != 1 || logs[0].Status != want {
+			t.Fatalf("request %q audit logs = %+v, want exactly one status %d", requestID, logs, want)
+		}
+	}
+
+	request("role-permission-batch-success", []string{"view_detail", "resource_manage"}, http.StatusNoContent)
+	request("role-permission-batch-invalid", []string{"view_detail", "not-grantable"}, http.StatusBadRequest)
+	grants, err := e.RolePermissions(roleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range grants {
+		for _, operation := range grant.Operations {
+			if operation == "not-grantable" {
+				t.Fatalf("invalid operation was partially committed: %+v", grants)
+			}
+		}
+	}
+}
+
 func TestAuditTrailReplacesOversizedRequestID(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
 	body := bytes.NewBufferString(`{"id":"d-request-id","name":"Request ID"}`)
