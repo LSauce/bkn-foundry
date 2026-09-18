@@ -77,7 +77,7 @@ func Init(ctx context.Context, appSetting *common.AppSetting, vbs interfaces.Veg
 		// Create dataset
 		logger.Infof("Dataset %s not found, creating...", interfaces.BKN_DATASET_NAME)
 
-		dataset = bknConceptDatasetRequest(expectedSchema, defaultEmbeddingModel)
+		dataset = bknConceptDatasetRequest(expectedSchema, defaultEmbeddingModel, catalog.Builtin)
 		err = vbs.CreateResource(ctx, dataset)
 		if err != nil {
 			logger.Errorf("CreateResource err:%v", err)
@@ -96,7 +96,7 @@ func Init(ctx context.Context, appSetting *common.AppSetting, vbs interfaces.Veg
 			}
 
 			// Create dataset again
-			dataset = bknConceptDatasetRequest(expectedSchema, defaultEmbeddingModel)
+			dataset = bknConceptDatasetRequest(expectedSchema, defaultEmbeddingModel, catalog.Builtin)
 			err = vbs.CreateResource(ctx, dataset)
 			if err != nil {
 				logger.Errorf("CreateResource err:%v", err)
@@ -123,8 +123,9 @@ func sameDefaultEmbeddingModel(indexConfig *interfaces.VegaResourceIndexConfig, 
 // concept dataset. A vector schema requires Vega to resolve an embedding model
 // at creation time, so propagate the model selected by BKN instead of allowing
 // Vega to fall back to its legacy "embedding" model name.
-func bknConceptDatasetRequest(schema []*interfaces.Property, defaultEmbeddingModel string) *interfaces.VegaResource {
+func bknConceptDatasetRequest(schema []*interfaces.Property, defaultEmbeddingModel string, builtin bool) *interfaces.VegaResource {
 	request := *interfaces.BKN_CONCEPT_DATASET
+	request.Builtin = builtin
 	request.SchemaDefinition = schema
 	request.IndexConfig = &interfaces.VegaResourceIndexConfig{
 		DefaultFulltextAnalyzer: "standard",

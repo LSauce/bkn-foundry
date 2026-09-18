@@ -12,8 +12,11 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
+	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/mitchellh/mapstructure"
 	_ "github.com/sijms/go-ora/v2"
 
@@ -189,7 +192,38 @@ func (c *OracleConnector) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Build connection string
+	if c.effectiveConnectorType() == interfaces.ConnectorTypeOceanBaseOracle {
+		cfg := mysql.NewConfig()
+		cfg.User = c.config.Username
+		cfg.Passwd = c.config.Password
+		cfg.Net = "tcp"
+		cfg.Addr = fmt.Sprintf("%s:%d", c.config.Host, c.config.Port)
+		cfg.ParseTime = true
+		cfg.InterpolateParams = true
+		cfg.OceanBaseOracle = true
+		cfg.Timeout = 10 * time.Second
+		cfg.ReadTimeout = 30 * time.Second
+		cfg.WriteTimeout = 30 * time.Second
+		cfg.Params = make(map[string]string)
+		for key, value := range c.config.Options {
+			cfg.Params[key] = fmt.Sprintf("%v", value)
+		}
+
+		connector, err := mysql.NewConnector(cfg)
+		if err != nil {
+			return err
+		}
+		db := sql.OpenDB(connector)
+		if err := db.PingContext(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		c.db = db
+		c.connected = true
+		return nil
+	}
+
+	// Build the native Oracle connection string.
 	values := url.Values{}
 
 	// Apply options
@@ -214,6 +248,23 @@ func (c *OracleConnector) Connect(ctx context.Context) error {
 	c.connected = true
 
 	return nil
+}
+
+var oracleBindVariablePattern = regexp.MustCompile(`:\d+`)
+
+func (c *OracleConnector) bindQuery(query string) string {
+	if c.effectiveConnectorType() == interfaces.ConnectorTypeOceanBaseOracle {
+		return oracleBindVariablePattern.ReplaceAllString(query, "?")
+	}
+	return query
+}
+
+func (c *OracleConnector) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return c.db.QueryContext(ctx, c.bindQuery(query), args...)
+}
+
+func (c *OracleConnector) queryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return c.db.QueryRowContext(ctx, c.bindQuery(query), args...)
 }
 
 // Close closes the database connection.
@@ -319,7 +370,7 @@ func (c *OracleConnector) ExecuteRawSQL(ctx context.Context, statement string) (
 func (c *OracleConnector) validateSchemas(ctx context.Context) error {
 	// Get all schemas list
 	query := "SELECT USERNAME FROM ALL_USERS"
-	rows, err := c.db.QueryContext(ctx, query)
+	rows, err := c.queryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to list schemas: %w", err)
 	}
@@ -393,7 +444,7 @@ func (c *OracleConnector) listTables(ctx context.Context, schema, tableName stri
 		query += " AND OBJECT_NAME = :1"
 		args = append(args, strings.ToUpper(tableName))
 	}
-	rows, err := c.db.QueryContext(ctx, query, args...)
+	rows, err := c.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tables: %w", err)
 	}
@@ -542,7 +593,7 @@ func (c *OracleConnector) fetchTableStatus(ctx context.Context, table *interface
 	var description sql.NullString
 	var lastAnalyzed sql.NullTime
 
-	row := c.db.QueryRowContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
+	row := c.queryRowContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
 	if err := row.Scan(
 		&objectType,
 		&tableRows,
@@ -595,7 +646,7 @@ func (c *OracleConnector) fetchColumns(ctx context.Context, table *interfaces.Ta
 		ORDER BY COLUMN_ID
 	`
 
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
+	rows, err := c.queryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
 	if err != nil {
 		return err
 	}
@@ -662,7 +713,7 @@ func (c *OracleConnector) fetchIndexes(ctx context.Context, table *interfaces.Ta
 		ORDER BY I.INDEX_NAME, IC.COLUMN_POSITION
 	`
 
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
+	rows, err := c.queryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
 	if err != nil {
 		return err
 	}
@@ -726,7 +777,7 @@ func (c *OracleConnector) fetchForeignKeys(ctx context.Context, table *interface
 		ORDER BY C.CONSTRAINT_NAME, CC.POSITION
 	`
 
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
+	rows, err := c.queryContext(ctx, query, strings.ToUpper(table.Database), strings.ToUpper(table.Name))
 	if err != nil {
 		return err
 	}

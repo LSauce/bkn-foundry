@@ -1,5 +1,7 @@
 module vega-backend
 
+replace github.com/go-sql-driver/mysql => ./third_party/go-sql-driver/mysql
+
 go 1.25.0
 
 require (

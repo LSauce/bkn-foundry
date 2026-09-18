@@ -39,9 +39,10 @@ var TypeMapping = map[string]string{
 	"nvarchar2": "string",
 
 	// Text types
-	"clob":  "text",
-	"nclob": "text",
-	"long":  "text",
+	"clob":     "text",
+	"nclob":    "text",
+	"long":     "text",
+	"longtext": "text",
 
 	// Date/Time types
 	"date":                           "datetime",

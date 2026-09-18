@@ -207,7 +207,7 @@ func TestInitKeepsDatasetWhenSchemaAndEmbeddingModelIDMatch(t *testing.T) {
 
 func TestBKNConceptDatasetRequest(t *testing.T) {
 	Convey("Dataset request keeps the global template immutable\n", t, func() {
-		request := bknConceptDatasetRequest(nil, "text-embedding-v4")
+		request := bknConceptDatasetRequest(nil, "text-embedding-v4", true)
 
 		So(request, ShouldNotEqual, interfaces.BKN_CONCEPT_DATASET)
 		So(request.Builtin, ShouldBeTrue)
