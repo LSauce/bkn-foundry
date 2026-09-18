@@ -34,6 +34,7 @@ const (
 	ConnectorTypePostgreSQL      string = "postgresql"
 	ConnectorTypeSQLServer       string = "sqlserver"
 	ConnectorTypeOpenSearch      string = "opensearch"
+	ConnectorTypeMongoDB         string = "mongodb"
 	ConnectorTypeOracle          string = "oracle"
 	ConnectorTypeOceanBaseOracle string = "oceanbase_oracle"
 	ConnectorTypeAnyShare        string = "anyshare"

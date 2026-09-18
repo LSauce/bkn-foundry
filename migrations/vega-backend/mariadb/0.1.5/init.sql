@@ -184,6 +184,8 @@ FROM DUAL WHERE NOT EXISTS ( SELECT f_type FROM t_connector_type WHERE f_type = 
 INSERT INTO t_connector_type (f_type, f_name, f_description, f_mode, f_category, f_enabled)
 SELECT 'oceanbase_oracle', 'oceanbase_oracle', 'OceanBase Oracle 兼容模式关系型数据库连接器', 'local', 'table', TRUE
 FROM DUAL WHERE NOT EXISTS ( SELECT f_type FROM t_connector_type WHERE f_type = 'oceanbase_oracle' );
+SELECT 'mongodb', 'mongodb', 'MongoDB 文档数据库连接器', 'local', 'index', TRUE
+FROM DUAL WHERE NOT EXISTS ( SELECT f_type FROM t_connector_type WHERE f_type = 'mongodb' );
 
 INSERT INTO t_connector_type (f_type, f_name, f_description, f_mode, f_category, f_enabled)
 SELECT 'sqlserver', 'sqlserver', 'Microsoft SQL Server 关系型数据库连接器', 'local', 'table', TRUE

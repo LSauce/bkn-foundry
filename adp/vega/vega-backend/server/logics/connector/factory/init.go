@@ -9,6 +9,7 @@ package factory
 import (
 	"vega-backend/interfaces"
 	"vega-backend/logics/connector/local/fileset/anyshare"
+	"vega-backend/logics/connector/local/index/mongodb"
 	"vega-backend/logics/connector/local/index/opensearch"
 	"vega-backend/logics/connector/local/table/mariadb"
 	"vega-backend/logics/connector/local/table/oracle"
@@ -22,6 +23,7 @@ func (cf *connectorFactory) initLocalConnectors() {
 
 	cf.connectors[interfaces.ConnectorTypeMySQL] = mariadb.NewMariaDBConnector()
 	cf.connectors[interfaces.ConnectorTypeOpenSearch] = opensearch.NewOpenSearchConnector()
+	cf.connectors[interfaces.ConnectorTypeMongoDB] = mongodb.NewMongoDBConnector()
 	cf.connectors[interfaces.ConnectorTypeMariaDB] = mariadb.NewMariaDBConnector()
 	cf.connectors[interfaces.ConnectorTypePostgreSQL] = postgresql.NewPostgresqlConnector()
 	cf.connectors[interfaces.ConnectorTypeOceanBaseOracle] = oracle.NewOceanBaseOracleConnector()
