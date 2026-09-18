@@ -30,6 +30,7 @@ func TestMapDataSourceTypeToDialect(t *testing.T) {
 		{name: "sqlserver", sourceType: interfaces.ConnectorTypeSQLServer, want: "tsql"},
 		{name: "tsql target dialect", sourceType: "tsql", want: "tsql"},
 		{name: "maria alias", sourceType: "maria", want: "mysql"},
+		{name: "oceanbase oracle", sourceType: interfaces.ConnectorTypeOceanBaseOracle, want: "oracle"},
 	}
 
 	for _, tc := range cases {
@@ -41,7 +42,7 @@ func TestMapDataSourceTypeToDialect(t *testing.T) {
 		})
 	}
 	t.Run("returns error for unsupported source type", func(t *testing.T) {
-		got, err := MapDataSourceTypeToDialect("oracle")
+		got, err := MapDataSourceTypeToDialect(interfaces.ConnectorTypeOracle)
 
 		require.Error(t, err)
 		assert.Empty(t, got)
@@ -69,7 +70,7 @@ func TestTranspileSQL(t *testing.T) {
 	})
 
 	t.Run("returns mapping error before invoking sqlglot", func(t *testing.T) {
-		got, err := TranspileSQL(context.Background(), "select * from t", "mysql", "oracle")
+		got, err := TranspileSQL(context.Background(), "select * from t", "mysql", interfaces.ConnectorTypeOracle)
 
 		require.Error(t, err)
 		assert.Nil(t, got)

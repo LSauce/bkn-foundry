@@ -107,6 +107,8 @@ func MapDataSourceTypeToDialect(dataSourceType string) (string, error) {
 		return "mysql", nil // MariaDB uses the mysql dialect
 	case "tsql", interfaces.ConnectorTypeSQLServer:
 		return "tsql", nil
+	case interfaces.ConnectorTypeOceanBaseOracle:
+		return "oracle", nil
 	default:
 		logger.Errorf("unsupported dataSourceType: %s", dataSourceType)
 		return "", fmt.Errorf("unsupported dataSourceType: %s", dataSourceType)

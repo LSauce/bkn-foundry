@@ -7,6 +7,8 @@
 // Package oracle provides Oracle database connector implementation.
 package oracle
 
+import "strings"
+
 // TypeMapping maps Oracle native types to VEGA types.
 var TypeMapping = map[string]string{
 	// Integer types
@@ -67,7 +69,8 @@ var TypeMapping = map[string]string{
 
 // MapType returns VEGA type for Oracle native type.
 func (c *OracleConnector) MapType(nativeType string) string {
-	if vegaType, ok := TypeMapping[nativeType]; ok {
+	normalizedType := strings.ToLower(strings.Join(strings.Fields(nativeType), " "))
+	if vegaType, ok := TypeMapping[normalizedType]; ok {
 		return vegaType
 	}
 	return "unsupported" // default

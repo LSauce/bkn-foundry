@@ -29,23 +29,25 @@ var (
 
 // Connector type constant definition
 const (
-	ConnectorTypeMySQL      string = "mysql"
-	ConnectorTypeMariaDB    string = "mariadb"
-	ConnectorTypePostgreSQL string = "postgresql"
-	ConnectorTypeSQLServer  string = "sqlserver"
-	ConnectorTypeOpenSearch string = "opensearch"
-	ConnectorTypeOracle     string = "oracle"
-	ConnectorTypeAnyShare   string = "anyshare"
+	ConnectorTypeMySQL           string = "mysql"
+	ConnectorTypeMariaDB         string = "mariadb"
+	ConnectorTypePostgreSQL      string = "postgresql"
+	ConnectorTypeSQLServer       string = "sqlserver"
+	ConnectorTypeOpenSearch      string = "opensearch"
+	ConnectorTypeOracle          string = "oracle"
+	ConnectorTypeOceanBaseOracle string = "oceanbase_oracle"
+	ConnectorTypeAnyShare        string = "anyshare"
 )
 
 // The list of connector types supported by the current unified query interface
 // Note: The system supports more connector types, but the current unified query interface only supports the following types
 var SupportedConnectorTypesForQuery = map[string]bool{
-	ConnectorTypeMySQL:      true,
-	ConnectorTypeMariaDB:    true,
-	ConnectorTypePostgreSQL: true,
-	ConnectorTypeSQLServer:  true,
-	ConnectorTypeOpenSearch: true,
+	ConnectorTypeMySQL:           true,
+	ConnectorTypeMariaDB:         true,
+	ConnectorTypePostgreSQL:      true,
+	ConnectorTypeSQLServer:       true,
+	ConnectorTypeOpenSearch:      true,
+	ConnectorTypeOceanBaseOracle: true,
 }
 
 // Support GetSupportedConnectorTypesForQuery returns the current unified query interface connector type list
@@ -57,6 +59,7 @@ func GetSupportedConnectorTypesForQuery() []string {
 		ConnectorTypePostgreSQL,
 		ConnectorTypeSQLServer,
 		ConnectorTypeOpenSearch,
+		ConnectorTypeOceanBaseOracle,
 	}
 }
 

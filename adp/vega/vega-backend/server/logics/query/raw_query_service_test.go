@@ -436,6 +436,15 @@ func TestQueryExecutionContext(t *testing.T) {
 	})
 }
 
+func TestTargetDialectForOceanBaseOracleCatalog(t *testing.T) {
+	dialect, err := targetDialectForCatalog(context.Background(), &interfaces.Catalog{
+		ConnectorType: interfaces.ConnectorTypeOceanBaseOracle,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "oracle", dialect)
+}
+
 func TestRawQueryServiceExecuteInitialSQLQuery(t *testing.T) {
 	t.Run("propagates query timeout to validation", func(t *testing.T) {
 		ctrl := gomock.NewController(t)

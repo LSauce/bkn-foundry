@@ -44,6 +44,15 @@ func TestOracleConnectorMetadata(t *testing.T) {
 	})
 }
 
+func TestOceanBaseOracleConnectorMetadata(t *testing.T) {
+	connector := NewOceanBaseOracleConnector()
+
+	assert.Equal(t, interfaces.ConnectorTypeOceanBaseOracle, connector.GetType())
+	assert.Equal(t, interfaces.ConnectorTypeOceanBaseOracle, connector.GetName())
+	assert.Equal(t, interfaces.ConnectorModeLocal, connector.GetMode())
+	assert.Equal(t, interfaces.ConnectorCategoryTable, connector.GetCategory())
+}
+
 func TestOracleConnectorBuildPagedSQL(t *testing.T) {
 	connector := &OracleConnector{}
 	assert.Equal(t,
@@ -356,6 +365,22 @@ func TestOracleConnectorNew(t *testing.T) {
 	})
 }
 
+func TestOceanBaseOracleConnectorNewPreservesType(t *testing.T) {
+	builder := NewOceanBaseOracleConnector()
+	connector, err := builder.New(interfaces.ConnectorConfig{
+		"host":         "127.0.0.1",
+		"port":         2881,
+		"service_name": "ORACLE_TENANT",
+		"username":     "vega_reader@oracle_tenant",
+		"password":     "secret",
+		"schemas":      []string{"APP"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, interfaces.ConnectorTypeOceanBaseOracle, connector.GetType())
+	assert.Equal(t, interfaces.ConnectorTypeOceanBaseOracle, connector.GetName())
+}
+
 func TestOracleConnectorMapType(t *testing.T) {
 	connector := &OracleConnector{}
 
@@ -377,6 +402,11 @@ func TestOracleConnectorMapType(t *testing.T) {
 		{
 			name:       "datetime",
 			nativeType: "timestamp with time zone",
+			want:       "datetime",
+		},
+		{
+			name:       "normalizes driver type name",
+			nativeType: "TIMESTAMP   WITH TIME ZONE",
 			want:       "datetime",
 		},
 		{

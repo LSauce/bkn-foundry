@@ -717,6 +717,8 @@ func targetDialectForCatalog(ctx context.Context, catalog *interfaces.Catalog) (
 		return "postgres", nil
 	case interfaces.ConnectorTypeSQLServer:
 		return "tsql", nil
+	case interfaces.ConnectorTypeOceanBaseOracle:
+		return "oracle", nil
 	default:
 		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("unsupported connector type: %s", catalog.ConnectorType))

@@ -16,7 +16,7 @@
 
 ## 🗃️ 支持的数据库类型
 
-mysql、postgresql、sqlserver、oracle、clickhouse、hive、opensearch、elasticsearch 等。执行 `openbkn vega connector-type list` 查看当前平台已安装的连接器类型。
+mysql、postgresql、sqlserver、oracle、OceanBase Oracle、clickhouse、hive、opensearch、elasticsearch 等。执行 `openbkn vega connector-type list` 查看当前平台已安装的连接器类型。
 
 ### CLI
 
@@ -31,6 +31,10 @@ openbkn vega catalog create --name "erp" --connector-type mysql \
 # 注册 PostgreSQL
 openbkn vega catalog create --name "分析库" --connector-type postgresql \
   --connector-config '{"host":"pg.example.com","port":5432,"username":"reader","password":"pass456","databases":["analytics"]}'
+
+# 注册 OceanBase Oracle 模式租户
+openbkn vega catalog create --name "OceanBase 业务库" --connector-type oceanbase_oracle \
+  --connector-config '{"host":"obproxy.example.com","port":2883,"service_name":"ORACLE_TENANT","username":"reader@oracle_tenant#cluster_name","password":"pass789","schemas":["APP"]}'
 ```
 
 `connector_config` 的字段随连接器类型而异，以 `openbkn vega connector-type get <type>` 返回的 schema 为准。**主机地址须由 vega-backend 所在网络可达**——通常是内网地址，而不是你本机能连通的那个。

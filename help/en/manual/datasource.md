@@ -16,7 +16,7 @@ Ingress prefix (typical):
 
 ## 🗃️ Supported database types
 
-mysql, postgresql, sqlserver, oracle, clickhouse, hive, opensearch, elasticsearch, and more. Run `openbkn vega connector-type list` to see which connector types are installed on your platform.
+mysql, postgresql, sqlserver, oracle, OceanBase Oracle, clickhouse, hive, opensearch, elasticsearch, and more. Run `openbkn vega connector-type list` to see which connector types are installed on your platform.
 
 ## CLI
 
@@ -31,6 +31,10 @@ openbkn vega catalog create --name "erp" --connector-type mysql \
 # PostgreSQL
 openbkn vega catalog create --name "analytics" --connector-type postgresql \
   --connector-config '{"host":"pg.example.com","port":5432,"username":"reader","password":"pass456","databases":["analytics"]}'
+
+# OceanBase tenant in Oracle mode
+openbkn vega catalog create --name "oceanbase-business" --connector-type oceanbase_oracle \
+  --connector-config '{"host":"obproxy.example.com","port":2883,"service_name":"ORACLE_TENANT","username":"reader@oracle_tenant#cluster_name","password":"pass789","schemas":["APP"]}'
 ```
 
 The fields inside `connector_config` vary by connector type; the schema returned by `openbkn vega connector-type get <type>` is authoritative. **The host must be reachable from the network vega-backend runs in** — usually an internal address, not the one your laptop can reach.

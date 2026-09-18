@@ -80,10 +80,11 @@ const (
 
 // OracleConnector implements TableConnector for Oracle.
 type OracleConnector struct {
-	enabled   bool
-	config    *oracleConfig
-	connected bool
-	db        *sql.DB
+	connectorType string
+	enabled       bool
+	config        *oracleConfig
+	connected     bool
+	db            *sql.DB
 }
 
 // NewOracleConnector creates Oracle connector builder
@@ -91,14 +92,26 @@ func NewOracleConnector() interfaces.TableConnector {
 	return &OracleConnector{}
 }
 
+// NewOceanBaseOracleConnector creates an OceanBase Oracle-compatible connector builder.
+func NewOceanBaseOracleConnector() interfaces.TableConnector {
+	return &OracleConnector{connectorType: interfaces.ConnectorTypeOceanBaseOracle}
+}
+
+func (c *OracleConnector) effectiveConnectorType() string {
+	if c.connectorType != "" {
+		return c.connectorType
+	}
+	return interfaces.ConnectorTypeOracle
+}
+
 // GetType returns the data source type.
 func (c *OracleConnector) GetType() string {
-	return interfaces.ConnectorTypeOracle
+	return c.effectiveConnectorType()
 }
 
 // GetName returns the connector name.
 func (c *OracleConnector) GetName() string {
-	return interfaces.ConnectorTypeOracle
+	return c.effectiveConnectorType()
 }
 
 // GetMode returns the connector mode.
@@ -164,7 +177,8 @@ func (c *OracleConnector) New(cfg interfaces.ConnectorConfig) (interfaces.Connec
 	}
 
 	return &OracleConnector{
-		config: &oCfg,
+		connectorType: c.effectiveConnectorType(),
+		config:        &oCfg,
 	}, nil
 }
 
