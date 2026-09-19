@@ -79,10 +79,10 @@ func TestValidateRequirementsAcceptsMultipleDirectPrerequisites(t *testing.T) {
 	}
 }
 
-// TestShippedCatalogBindsManagementToViewDetail pins the Catalog contract:
-// every management operation is reachable only after opening that Catalog,
-// while creation and data queries remain independent capabilities.
-func TestShippedCatalogBindsManagementToViewDetail(t *testing.T) {
+// TestShippedCatalogBindsOperationsToViewDetail pins the Catalog contract:
+// every instance operation is reachable only after opening that Catalog;
+// creation remains a type-level capability.
+func TestShippedCatalogBindsOperationsToViewDetail(t *testing.T) {
 	var c catalog
 	if err := json.Unmarshal(catalogJSON, &c); err != nil {
 		t.Fatalf("parse authorization-registry.json: %v", err)
@@ -98,12 +98,12 @@ func TestShippedCatalogBindsManagementToViewDetail(t *testing.T) {
 		for _, op := range rt.Operations {
 			operations[op.ID] = op.Requires
 		}
-		for _, operation := range []string{"modify", "delete", "authorize", "task_manage", "resource_manage"} {
+		for _, operation := range []string{"modify", "delete", "authorize", "task_manage", "resource_manage", "query_data", "data_write"} {
 			if got := operations[operation]; len(got) != 1 || got[0] != "view_detail" {
 				t.Errorf("catalog/%s requires %v, want [view_detail]", operation, got)
 			}
 		}
-		for _, operation := range []string{"view_detail", "create", "query_data", "data_write"} {
+		for _, operation := range []string{"view_detail", "create"} {
 			if got := operations[operation]; len(got) != 0 {
 				t.Errorf("catalog/%s unexpectedly requires %v", operation, got)
 			}
@@ -254,6 +254,10 @@ func TestCatalogManagementRequirementsDoNotChangeReadDecisions(t *testing.T) {
 	mustNoErrSeed(t, e.DenyObjectPermission(queryUser, "catalog", resource, "view_detail"))
 	if allowed, err := e.Check(queryUser, "catalog", resource, "query_data"); err != nil || !allowed {
 		t.Fatalf("catalog/query_data = %v, %v; want independent allow", allowed, err)
+	}
+	ids, err := e.AccessibleResources(queryUser, "catalog", "query_data")
+	if err != nil || !reflect.DeepEqual(ids, []string{resource}) {
+		t.Fatalf("AccessibleResources(catalog/query_data) = %v, %v; want [%s]", ids, err, resource)
 	}
 	filtered, err := e.FilterResourceOps(queryUser,
 		[]authz.ResourceRef{{Type: "catalog", ID: resource}}, nil, []string{"query_data"})
@@ -465,7 +469,7 @@ func TestBackfillRepairsGrantsWrittenBeforeTheRule(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	// An unrelated grant on the same type must come through untouched.
+	// A data grant follows the same visibility prerequisite as management.
 	if err := e.GrantProfessionalObjectPermission(
 		"u-2", "catalog", "c2", "query_data", authz.EffectAllow, authz.AuthoritySourceAdminAuthz,
 	); err != nil {
@@ -482,8 +486,8 @@ func TestBackfillRepairsGrantsWrittenBeforeTheRule(t *testing.T) {
 	if ok, _ := e.Check("u-1", "catalog", "c1", "resource_manage"); !ok {
 		t.Fatal("backfill dropped the operation it was repairing")
 	}
-	if ok, _ := e.Check("u-2", "catalog", "c2", "view_detail"); ok {
-		t.Fatal("backfill widened a grant that requires nothing")
+	if ok, _ := e.Check("u-2", "catalog", "c2", "view_detail"); !ok {
+		t.Fatal("backfill did not repair the data grant")
 	}
 
 	// Idempotent: a start with nothing left to repair changes nothing.
@@ -508,15 +512,23 @@ func TestBackfillRepairsGrantsWrittenBeforeTheRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 1 {
-		t.Fatalf("audit rows for the backfill = %d, want 1", total)
+	if total != 2 {
+		t.Fatalf("audit rows for the backfill = %d, want 2", total)
 	}
-	got := entries[0]
-	if got.ActorID != "system:seed" || got.TargetID != "c1" {
-		t.Fatalf("audit row = %+v", got)
+	byTarget := make(map[string]model.AuditLog, len(entries))
+	for _, entry := range entries {
+		byTarget[entry.TargetID] = entry
+	}
+	got := byTarget["c1"]
+	if got.ActorID != "system:seed" {
+		t.Fatalf("resource_manage audit row = %+v", got)
 	}
 	if !strings.Contains(got.Detail, "view_detail") || !strings.Contains(got.Detail, "resource_manage") {
-		t.Fatalf("audit detail does not name the operations: %s", got.Detail)
+		t.Fatalf("resource_manage audit detail does not name the operations: %s", got.Detail)
+	}
+	if got := byTarget["c2"]; got.ActorID != "system:seed" ||
+		!strings.Contains(got.Detail, "query_data") || !strings.Contains(got.Detail, "view_detail") {
+		t.Fatalf("query_data audit row = %+v", got)
 	}
 }
 
